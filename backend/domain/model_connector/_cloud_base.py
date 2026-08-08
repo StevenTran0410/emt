@@ -1,0 +1,97 @@
+"""Shared base for all cloud provider adapters."""
+from __future__ import annotations
+
+from urllib.parse import urlsplit
+
+import httpx
+
+from shared.logger import logger
+
+from ._adapter_mixin import StreamFallbackMixin
+from .errors import ProviderError, ProviderErrorCode
+from .types import ProviderConfig
+
+
+class CloudAdapterBase(StreamFallbackMixin):
+    def __init__(self, config: ProviderConfig, base_url: str | None = None) -> None:
+        self.config = config
+        self._default_base = base_url
+        self._client = httpx.AsyncClient(
+            base_url=config.base_url or base_url,
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0),
+        )
+
+    def _url(self, path: str) -> str:
+        """Absolute URL for an API `path` given WITHOUT its version segment (e.g. 'models',
+        'chat/completions'). A host-only base (OpenAI's own https://api.openai.com) gets the '/v1'
+        version segment added here; a base that already carries its version path keeps it as-is —
+        e.g. OpenRouter's https://openrouter.ai/api/v1, whose '/api/v1' httpx would otherwise DROP
+        when a leading-slash request path resolves as absolute-from-root, yielding a 404. Passing an
+        absolute URL bypasses that join entirely."""
+        base = (self.config.base_url or self._default_base or "").rstrip("/")
+        if not urlsplit(base).path:  # host-only, no version path -> add OpenAI's default '/v1'
+            base = f"{base}/v1"
+        return f"{base}/{path.lstrip('/')}"
+
+    @property
+    def _api_key(self) -> str:
+        return str(self.config.extra.get("api_key", ""))
+
+    def _require_api_key(self) -> str:
+        key = self._api_key
+        if not key:
+            raise ProviderError(
+                ProviderErrorCode.AUTH_FAILED,
+                "No API key configured. Add your API key in provider settings.",
+                provider_id=self.config.id,
+            )
+        return key
+
+    def _map_http_error(self, e: httpx.HTTPStatusError) -> ProviderError:
+        status = e.response.status_code
+        try:
+            body = e.response.json()
+            msg = (
+                body.get("error", {}).get("message")
+                or body.get("message")
+                or body.get("error")
+                or str(body)
+            )
+        except Exception:
+            msg = e.response.text[:300]
+
+        code_map = {
+            401: ProviderErrorCode.AUTH_FAILED,
+            403: ProviderErrorCode.AUTH_FAILED,
+            404: ProviderErrorCode.MODEL_NOT_FOUND,
+            429: ProviderErrorCode.RATE_LIMITED,
+        }
+        code = code_map.get(status, ProviderErrorCode.UNKNOWN)
+        # 4xx errors are client-side bugs (bad request, auth, model not found) — log at ERROR
+        # so they surface clearly in the terminal, not hidden among INFO/WARNING noise.
+        # 429 is excluded because it is expected under load and handled by callers.
+        if 400 <= status < 500 and status != 429:
+            logger.error(
+                "[provider:%s] HTTP %d from %s — %s",
+                self.config.id, status, self.config.base_url, msg,
+            )
+        return ProviderError(code, f"HTTP {status}: {msg}", provider_id=self.config.id)
+
+    def _map_connect_error(self, e: httpx.ConnectError) -> ProviderError:
+        return ProviderError(
+            ProviderErrorCode.CONNECTION_REFUSED,
+            f"Cannot connect to {self.config.base_url}: {e}",
+            provider_id=self.config.id,
+            retryable=True,
+        )
+
+    def _map_timeout(self, e: httpx.TimeoutException) -> ProviderError:
+        return ProviderError(
+            ProviderErrorCode.TIMEOUT,
+            "Request timed out.",
+            provider_id=self.config.id,
+            retryable=True,
+        )
+
+    async def aclose(self) -> None:
+        await self._client.aclose()

@@ -1,0 +1,69 @@
+# Planning docs — local only, not committed
+repo_atlas_plan/
+CodeSpectra_doc/
+
+# Claude agent configs — local only
+.claude/
+AGENTS.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+dist/
+out/
+build/
+.turbo/
+
+# Env
+.env
+.env.*
+
+# Logs
+*.log
+logs/
+
+# Python
+backend/.venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/**/*.pyc
+backend/**/*.pyo
+backend/**/*.pyd
+backend/**/*.so
+backend/*.egg-info/
+backend/dist/
+backend/.pytest_cache/
+backend/.ruff_cache/
+*.db
+*.db-shm
+*.db-wal
+classifier_model.pkl
+classifier_meta.json
+
+# Python — agent_eval_harness (AEH, CS-261+)
+agent_eval_harness/.venv/
+agent_eval_harness/uv.lock
+agent_eval_harness/__pycache__/
+agent_eval_harness/**/__pycache__/
+agent_eval_harness/**/*.pyc
+agent_eval_harness/*.egg-info/
+agent_eval_harness/.pytest_cache/
+agent_eval_harness/.ruff_cache/
+agent_eval_harness/.aeh_data/
+agent_eval_harness/.deepeval/
+.deepeval/
+.aeh/
+agent_eval_harness/scripts/*.preview.md
+
+# App data / local DB
+.database/
+
+# Working data: CardDemo corpus, generated docs, tickets, plans — local only
+emt_data/
+
+# Editor
+.idea/
+*.swp

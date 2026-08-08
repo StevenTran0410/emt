@@ -1,0 +1,335 @@
+"""RRF Multi-Signal Fusion Query System: combines BM25 lexical signal with graph-confidence signal via reciprocal rank fusion (RRF), producing debug bundles for analysis and comparison.
+
+Facade package: `retrieve_rrf_fusion` and `retrieve_rrf_fusion_as_bundle` stay physically in this
+`__init__.py` (rather than a submodule) so that `retrieve_rrf_fusion_as_bundle`'s bare-name call to
+`retrieve_rrf_fusion` keeps resolving through THIS module's globals -- which is what
+`monkeypatch.setattr("domain.retrieval.rrf_fusion.retrieve_rrf_fusion", fake)` patches.
+"""
+
+from __future__ import annotations
+
+import time
+
+from infrastructure.db.database import get_db
+from shared.logger import logger
+
+from ..bm25_scorer import BM25Scorer
+from ..cross_encoder_rerank import (
+    detect_gpu,
+    is_gpu_reranker_enabled,
+    recommended_rerank_batch_size,
+)
+from ..service import _CHUNK_FULL_COLS
+from ..two_stage_retrieval import (
+    _load_graph_context,
+    _query_terms,
+    _stage1_score_rows,
+    load_symbol_index,
+)
+from ..quality import compute_retrieval_quality
+from ..signal_builders import (
+    _best_chunk_per_file,
+    _load_confidence_weighted_edges,
+    build_bm25_rank_list,
+    build_category_hint_rank_list,
+    build_graph_confidence_rank_list,
+    build_module_proximity_rank_list,
+)
+from ..graph_signal import (
+    _expand_function_level_1hop,
+    _rerank_coverage_target,
+)
+from ..types import (
+    RankedChunk,
+    RetrievalBundle,
+    RetrievalEvidence,
+    RetrievalMode,
+    RetrievalSection,
+    RrfFusionBundle,
+)
+
+from .fusion import _fuse_final_ranking, _rerank_pool_in_batches, fuse_signal_lists
+
+__all__ = [
+    "fuse_signal_lists",
+    "retrieve_rrf_fusion",
+    "retrieve_rrf_fusion_as_bundle",
+]
+
+
+async def retrieve_rrf_fusion(
+    snapshot_id: str,
+    query: str,
+    section: RetrievalSection,
+    budget: int | None = None,  # Unused in this debug path, kept for API consistency
+    min_confidence: float | None = None,
+    symbol_chunks_only: bool = False,
+) -> RrfFusionBundle:
+    """Run RRF multi-signal fusion retrieval (debug path). Loads identical all_rows/ctx/symbol_index as retrieve_two_stage, builds all 4 signal rank lists (BM25, graph-confidence, module-proximity, category-hint), fuses via RRF, and returns raw unbounded results -- does NOT route through _rank_and_budget()/_apply_diversity_filter(), since this is a debug/comparison path, not a production synthesis input."""
+    db = get_db()
+    terms = _query_terms(query)
+    if not terms:
+        raise ValueError("Query must contain searchable terms")
+
+    # Load graph context and symbol index (same as two_stage_retrieval)
+    ctx = await _load_graph_context(snapshot_id, min_confidence)
+    symbol_index = await load_symbol_index(snapshot_id)
+
+    # Load all chunks
+    async with db.execute(
+        f"SELECT {_CHUNK_FULL_COLS} FROM retrieval_chunks WHERE snapshot_id=?",
+        (snapshot_id,),
+    ) as cur:
+        all_rows = list(await cur.fetchall())
+
+    if symbol_chunks_only:
+        # Non-function/class chunks (imports, file boundaries) carry no agent-specific logic to synthesize from.
+        all_rows = [r for r in all_rows if r["chunk_type"] in ("function", "class")]
+
+    if not all_rows:
+        raise ValueError("Retrieval index not built for this snapshot")
+
+    # Load BM25 scorer
+    async with db.execute(
+        "SELECT avgdl, idf_json, k1, b FROM retrieval_bm25_stats WHERE snapshot_id=?",
+        (snapshot_id,),
+    ) as cur:
+        bm25_row = await cur.fetchone()
+    scorer = BM25Scorer.from_stats_row(bm25_row)
+
+    # Stage 1: BM25 scoring
+    stage1_candidates = _stage1_score_rows(all_rows, scorer, terms, top_k=100)
+    stage1_files = {c.rel_path for c in stage1_candidates}
+
+    # Confidence-weighted edges, filtered to seed files in SQL instead of fetching every edge in the snapshot and filtering in Python.
+    confidence_edges = await _load_confidence_weighted_edges(snapshot_id, stage1_files)
+
+    # Compute seed_community_ids from top-20 stage1 candidates (mirrors two_stage_retrieval.py).
+    seed_community_ids: set[int] = set()
+    for c in stage1_candidates[:20]:
+        cid = ctx.file_community.get(c.rel_path)
+        if cid is not None:
+            seed_community_ids.add(cid)
+
+    # Convert all_rows to dicts once (reuse everywhere)
+    all_rows_dicts = [dict(r) for r in all_rows]
+
+    # Build chunk_content_by_id for reranking
+    chunk_content_by_id = {r["id"]: r.get("content", "") for r in all_rows_dicts}
+
+    # Precompute best_chunk_per_file once, thread into all 4 builders
+    best_chunk_by_file = _best_chunk_per_file(all_rows_dicts, stage1_candidates, symbol_index)
+
+    # Build all 4 signal lists
+    bm25_signal = build_bm25_rank_list(stage1_candidates, best_chunk_by_file, top_k=100)
+
+    graph_signal = build_graph_confidence_rank_list(
+        all_rows_dicts,
+        ctx,
+        stage1_files,
+        confidence_edges,
+        best_chunk_by_file,
+        top_k=100,
+    )
+
+    module_signal = build_module_proximity_rank_list(
+        all_rows_dicts,
+        ctx,
+        seed_community_ids,
+        best_chunk_by_file,
+        top_k=100,
+    )
+
+    category_signal = build_category_hint_rank_list(
+        all_rows_dicts,
+        section,
+        best_chunk_by_file,
+        top_k=100,
+    )
+
+    # Fuse all 4 signals via RRF
+    fused = fuse_signal_lists([bm25_signal, graph_signal, module_signal, category_signal])
+
+    # Call cross-encoder reranking with 1-hop expansion, gated by the global GPU Reranker toggle (off by default). Runs in VRAM-sized batches since the model joins all passages into one shared sequence per call, not pairwise.
+    final = []
+    if await is_gpu_reranker_enabled():
+        _, vram_gb = detect_gpu()
+        batch_size = recommended_rerank_batch_size(vram_gb)
+
+        # Function-level 1-hop expansion
+        target = _rerank_coverage_target(len(fused))
+        seed_pool = fused[:target]
+        expansion_cap = recommended_rerank_batch_size(vram_gb)  # Reuse VRAM-scaled ceiling for OOM-safety
+        expansion_candidates = await _expand_function_level_1hop(
+            snapshot_id, seed_pool, symbol_index, all_rows_dicts, expansion_cap
+        )
+
+        # Build expanded pool = fused[:target] + expansion (no re-truncation via _rerank_coverage_target)
+        expanded_pool = seed_pool + expansion_candidates
+
+        # Rerank the expanded pool (via new _rerank_pool_in_batches, avoiding the double-coverage-target footgun)
+        t0 = time.monotonic()
+        reranked, reranker_status = _rerank_pool_in_batches(
+            query, expanded_pool, chunk_content_by_id, batch_size
+        )
+        elapsed = time.monotonic() - t0
+
+        # Log reranking summary
+        if reranked and reranker_status == "ok":
+            num_batches = (len(expanded_pool) + batch_size - 1) // batch_size
+            logger.info(
+                "[rrf] reranked %d total candidates across %d batches in %.2fs for query=%r",
+                len(reranked),
+                num_batches,
+                elapsed,
+                query[:80],
+            )
+
+        # Final RRF-fuse of fused_rank (0.6) and cross_encoder_rank (0.4)
+        final = _fuse_final_ranking(fused, reranked, weights=(0.6, 0.4))
+    else:
+        reranked, reranker_status = [], "disabled"
+
+    return RrfFusionBundle(
+        snapshot_id=snapshot_id,
+        query=query,
+        section=section,
+        bm25_signal=bm25_signal,
+        graph_signal=graph_signal,
+        module_signal=module_signal,
+        category_signal=category_signal,
+        fused=fused,
+        reranked=reranked,
+        reranker_status=reranker_status,
+        final=final,
+    )
+
+
+_TOP_N_CHUNKS = 15
+_SPLIT_COMPLETE_THRESHOLD = 0.5
+
+
+async def retrieve_rrf_fusion_as_bundle(
+    snapshot_id: str,
+    query: str,
+    section: RetrievalSection,
+    budget: int,
+    mode: RetrievalMode = RetrievalMode.HYBRID,
+    min_confidence: float | None = None,
+) -> RetrievalBundle:
+    """Run RRF multi-signal fusion (+ cross-encoder + 1-hop-expand/final-fuse when the GPU reranker is enabled) and adapt it into the agent-compatible RetrievalBundle interface, mirroring retrieve_two_stage_as_bundle's shape. Uses `final` when the cross-encoder ran, falling back to the plain 4-signal `fused` list otherwise (no GPU / toggle off). Takes the top-N ranked chunks outright (N small enough that the section token budget is essentially never the real constraint) instead of accumulating by token budget, then completes any split function/class where a majority of its parts made the top-N -- avoids handing the LLM a function with an unexplained hole in the middle."""
+    bundle = await retrieve_rrf_fusion(snapshot_id, query, section, min_confidence=min_confidence)
+    ranked_entries = bundle.final if bundle.final else bundle.fused
+
+    top = ranked_entries[:_TOP_N_CHUNKS]
+    db = get_db()
+
+    # chunk_index/split_part/split_of aren't carried on FusedRankEntry -- look them up for just the top-N chunk_ids.
+    meta_by_id: dict[str, dict] = {}
+    if top:
+        top_ids = [e.chunk_id for e in top]
+        placeholders = ",".join("?" for _ in top_ids)
+        async with db.execute(
+            f"SELECT id, chunk_index, split_part, split_of, rel_path, content, start_line, end_line, token_estimate "
+            f"FROM retrieval_chunks WHERE snapshot_id=? AND id IN ({placeholders})",
+            (snapshot_id, *top_ids),
+        ) as cur:
+            meta_by_id = {r["id"]: dict(r) for r in await cur.fetchall()}
+    chunk_index_by_id = {cid: m["chunk_index"] for cid, m in meta_by_id.items()}
+    used_tokens = sum((e.token_estimate or 1) for e in top)
+
+    # Group top-N members of a split symbol by (rel_path, group start chunk_index).
+    groups: dict[tuple[str, int], dict] = {}
+    for e in top:
+        m = meta_by_id.get(e.chunk_id)
+        if not m or (m["split_of"] or 1) <= 1:
+            continue
+        group_key = (m["rel_path"], m["chunk_index"] - m["split_part"])
+        g = groups.setdefault(group_key, {"split_of": m["split_of"], "present_parts": set()})
+        g["present_parts"].add(m["split_part"])
+
+    extra_evidences: list[RetrievalEvidence] = []
+    for (rel_path, group_start), g in groups.items():
+        split_of = g["split_of"]
+        present = g["present_parts"]
+        if len(present) >= split_of or len(present) / split_of < _SPLIT_COMPLETE_THRESHOLD:
+            continue
+        missing = [p for p in range(split_of) if p not in present]
+        placeholders = ",".join("?" for _ in missing)
+        async with db.execute(
+            f"SELECT {_CHUNK_FULL_COLS} FROM retrieval_chunks "
+            f"WHERE snapshot_id=? AND rel_path=? AND split_part IN ({placeholders}) "
+            f"AND chunk_index BETWEEN ? AND ?",
+            (snapshot_id, rel_path, *missing, group_start, group_start + split_of - 1),
+        ) as cur:
+            missing_rows = await cur.fetchall()
+        for r in missing_rows:
+            tok = int(r["token_estimate"] or 1)
+            if used_tokens + tok > budget:
+                continue
+            extra_evidences.append(RetrievalEvidence(
+                chunk_id=r["id"],
+                rel_path=r["rel_path"],
+                chunk_index=r["chunk_index"],
+                reason_codes=["split-complete"],
+                score=0.0,
+                token_estimate=tok,
+                excerpt=r["content"] or "",
+                start_line=r["start_line"] or 0,
+                end_line=r["end_line"] or 0,
+            ))
+            used_tokens += tok
+
+    # Vector-only chunks (BM25 matched no term) arrive with empty rel_path/excerpt/lines -- backfill from the rows fetched above.
+    def _hydrate(e, attr, col, empty):
+        val = getattr(e, attr)
+        return val if val not in (empty, None) else (meta_by_id.get(e.chunk_id, {}).get(col) or empty)
+
+    evidences = [
+        RetrievalEvidence(
+            chunk_id=e.chunk_id,
+            rel_path=_hydrate(e, "rel_path", "rel_path", ""),
+            chunk_index=chunk_index_by_id.get(e.chunk_id, 0),
+            reason_codes=[f"rrf-{name}" for name in e.per_signal_ranks] or ["rrf-fusion"],
+            score=e.fused_score,
+            token_estimate=_hydrate(e, "token_estimate", "token_estimate", 0),
+            excerpt=_hydrate(e, "excerpt", "content", ""),
+            start_line=_hydrate(e, "start_line", "start_line", 0),
+            end_line=_hydrate(e, "end_line", "end_line", 0),
+        )
+        for e in top
+    ] + extra_evidences
+
+    quality = None
+    if top:
+        from ..two_stage_retrieval import _query_terms
+
+        terms = _query_terms(query)
+        ranked_chunks = [
+            RankedChunk(
+                chunk_id=e.chunk_id,
+                rel_path=_hydrate(e, "rel_path", "rel_path", ""),
+                chunk_index=chunk_index_by_id.get(e.chunk_id, 0),
+                score=e.fused_score,
+                chunk_type="block",
+                bm25_component=0.0,
+                symbol_bonus=0.0,
+                module_bonus=0.0,
+                centrality_bonus=0.0,
+                token_estimate=_hydrate(e, "token_estimate", "token_estimate", 0),
+                excerpt=_hydrate(e, "excerpt", "content", ""),
+            )
+            for e in top
+        ]
+        quality = compute_retrieval_quality(terms, ranked_chunks, top[0].fused_score)
+
+    return RetrievalBundle(
+        snapshot_id=snapshot_id,
+        mode=mode,
+        section=section,
+        query=query,
+        budget_tokens=budget,
+        used_tokens=used_tokens,
+        evidences=evidences,
+        quality=quality,
+    )

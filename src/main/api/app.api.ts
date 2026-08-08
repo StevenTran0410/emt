@@ -1,0 +1,22 @@
+import { ipcMain, app, clipboard, shell } from 'electron'
+import log from 'electron-log'
+import { BackendClient } from '../infrastructure/python-server/client'
+import { getPythonProcessManager } from '../infrastructure/python-server/server'
+
+export function registerAppHandlers(client: BackendClient): void {
+  ipcMain.handle('app:get-version', () => app.getVersion())
+  ipcMain.handle('app:get-user-data-path', () => app.getPath('userData'))
+  ipcMain.handle('app:get-logs-path', () => log.transports.file.getFile().path)
+  ipcMain.handle('app:get-diagnostics', () => client.get('/api/app/diagnostics'))
+  ipcMain.handle('app:copy-to-clipboard', (_e, text: string) => clipboard.writeText(text))
+  ipcMain.handle('app:show-in-folder', (_e, targetPath: string) => {
+    shell.showItemInFolder(targetPath)
+  })
+
+  ipcMain.handle('app:retry-backend', async () => {
+    const manager = getPythonProcessManager()
+    await manager.start().catch((err) => {
+      throw new Error(`Backend restart failed: ${err.message}`)
+    })
+  })
+}

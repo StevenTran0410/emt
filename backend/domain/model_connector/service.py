@@ -1,0 +1,353 @@
+"""ProviderConfigService — persistence + live adapter routing for LLM providers."""
+from __future__ import annotations
+
+import json
+from collections.abc import AsyncGenerator
+
+from infrastructure.db.database import get_db
+from shared.errors import ConflictError, NotFoundError
+from shared.logger import logger
+from shared.utils import new_id, utc_now_iso
+
+from .anthropic.adapter import AnthropicAdapter
+from .deepseek.adapter import DeepSeekAdapter
+from .errors import ProviderError
+from .gemini.adapter import GeminiAdapter
+from .lmstudio.adapter import LMStudioAdapter
+from .ollama.adapter import OllamaAdapter
+from .openai.adapter import OpenAIAdapter
+from .openrouter.adapter import OpenRouterAdapter
+from .reasoning import ModelInfo, classify, ReasoningStyle
+from .types import ChatRequest, ChatResponse, EmbedRequest, EmbedResponse, ProviderCapabilities, ProviderConfig, ProviderKind
+
+
+class TestConnectionResult:
+    def __init__(self, ok: bool, message: str, warning: str | None = None) -> None:
+        self.ok = ok
+        self.message = message
+        self.warning = warning
+
+
+def _get_adapter(config: ProviderConfig):
+    match config.kind:
+        case ProviderKind.OLLAMA:
+            return OllamaAdapter(config)
+        case ProviderKind.LM_STUDIO:
+            return LMStudioAdapter(config)
+        case ProviderKind.OPENAI:
+            return OpenAIAdapter(config)
+        case ProviderKind.ANTHROPIC:
+            return AnthropicAdapter(config)
+        case ProviderKind.GEMINI:
+            return GeminiAdapter(config)
+        case ProviderKind.DEEPSEEK:
+            return DeepSeekAdapter(config)
+        case ProviderKind.OPENROUTER:
+            return OpenRouterAdapter(config)
+        case _:
+            raise ValueError(f"Unknown provider kind: {config.kind}")
+
+
+def _mask_extra(extra: dict) -> dict:
+    """Remove api_key from extra; replace with has_api_key flag."""
+    masked = dict(extra)
+    if "api_key" in masked:
+        masked["has_api_key"] = bool(masked.pop("api_key"))
+    return masked
+
+
+def _openrouter_model_info(model_id: str, reasoning: dict | None) -> ModelInfo:
+    if not reasoning:
+        return ModelInfo(id=model_id, reasoning_style=ReasoningStyle.NONE)
+    efforts = reasoning.get("supported_efforts")
+    return ModelInfo(
+        id=model_id,
+        reasoning_style=ReasoningStyle.OPENROUTER,
+        supported_efforts=efforts if isinstance(efforts, list) and efforts else None,
+        supports_max_tokens=bool(reasoning.get("supports_max_tokens")),
+        reasoning_mandatory=bool(reasoning.get("mandatory")),
+        default_effort=reasoning.get("default_effort"),
+    )
+
+
+class ProviderConfigService:
+    async def list_all(self) -> list[ProviderConfig]:
+        db = get_db()
+        async with db.execute(
+            "SELECT * FROM provider_configs ORDER BY created_at ASC"
+        ) as cur:
+            rows = await cur.fetchall()
+        configs = [self._row_to_config(r) for r in rows]
+        return [c.model_copy(update={"extra": _mask_extra(dict(c.extra))}) for c in configs]
+
+    async def get_by_id(self, provider_id: str) -> ProviderConfig:
+        """Returns masked config (no api_key in extra) — safe for API responses."""
+        config = await self._get_by_id_full(provider_id)
+        return config.model_copy(update={"extra": _mask_extra(dict(config.extra))})
+
+    async def _get_by_id_full(self, provider_id: str) -> ProviderConfig:
+        """Returns unmasked config with api_key — for internal/adapter use only."""
+        db = get_db()
+        async with db.execute(
+            "SELECT * FROM provider_configs WHERE id = ?", (provider_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            raise NotFoundError("ProviderConfig", provider_id)
+        return self._row_to_config(row)
+
+    async def create(
+        self,
+        kind: ProviderKind,
+        display_name: str,
+        base_url: str,
+        model_id: str,
+        capabilities: ProviderCapabilities | None = None,
+        extra: dict | None = None,
+        api_key: str | None = None,
+    ) -> ProviderConfig:
+        db = get_db()
+
+        async with db.execute(
+            "SELECT 1 FROM provider_configs WHERE display_name = ?", (display_name,)
+        ) as cur:
+            if await cur.fetchone():
+                raise ConflictError(f"A provider named '{display_name}' already exists")
+
+        cfg_id = new_id()
+        now = utc_now_iso()
+        caps = (capabilities or ProviderCapabilities()).model_dump()
+        ext = dict(extra or {})
+        if api_key:
+            ext["api_key"] = api_key
+
+        await db.execute(
+            """INSERT INTO provider_configs
+               (id, kind, display_name, base_url, model_id, capabilities, extra, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (cfg_id, kind.value, display_name, base_url, model_id,
+             json.dumps(caps), json.dumps(ext), now, now),
+        )
+        await db.commit()
+        logger.info(f"Created provider config '{display_name}' ({cfg_id})")
+
+        return ProviderConfig(
+            id=cfg_id, kind=kind, display_name=display_name,
+            base_url=base_url, model_id=model_id,
+            capabilities=capabilities or ProviderCapabilities(),
+            extra=_mask_extra(ext),
+        )
+
+    async def update(
+        self,
+        provider_id: str,
+        display_name: str | None = None,
+        base_url: str | None = None,
+        model_id: str | None = None,
+        capabilities: ProviderCapabilities | None = None,
+        extra: dict | None = None,
+        api_key: str | None = None,
+    ) -> ProviderConfig:
+        existing = await self._get_by_id_full(provider_id)
+        db = get_db()
+
+        new_name = display_name or existing.display_name
+        new_url = base_url or existing.base_url
+        new_model = model_id or existing.model_id
+        new_caps = (capabilities or existing.capabilities).model_dump()
+        new_extra = dict(existing.extra)  # full extra with api_key
+        if extra is not None:
+            new_extra.update(extra)
+        if api_key:  # only update key if explicitly provided
+            new_extra["api_key"] = api_key
+
+        if display_name and display_name != existing.display_name:
+            async with db.execute(
+                "SELECT 1 FROM provider_configs WHERE display_name = ? AND id != ?",
+                (display_name, provider_id),
+            ) as cur:
+                if await cur.fetchone():
+                    raise ConflictError(f"A provider named '{display_name}' already exists")
+
+        now = utc_now_iso()
+        await db.execute(
+            """UPDATE provider_configs
+               SET display_name=?, base_url=?, model_id=?, capabilities=?, extra=?, updated_at=?
+               WHERE id=?""",
+            (new_name, new_url, new_model, json.dumps(new_caps), json.dumps(new_extra), now, provider_id),
+        )
+        await db.commit()
+        logger.info(f"Updated provider config {provider_id}")
+        return await self.get_by_id(provider_id)  # masked version
+
+    async def delete(self, provider_id: str) -> None:
+        db = get_db()
+        async with db.execute(
+            "DELETE FROM provider_configs WHERE id = ?", (provider_id,)
+        ) as cur:
+            if cur.rowcount == 0:
+                raise NotFoundError("ProviderConfig", provider_id)
+        await db.commit()
+        logger.info(f"Deleted provider config {provider_id}")
+
+    async def test_connection(self, provider_id: str) -> TestConnectionResult:
+        config = await self._get_by_id_full(provider_id)
+        adapter = _get_adapter(config)
+        try:
+            ok, message, warning = await adapter.test_connection()
+            return TestConnectionResult(ok=ok, message=message, warning=warning)
+        except ProviderError as e:
+            return TestConnectionResult(ok=False, message=e.message)
+        finally:
+            await adapter.aclose()
+
+    async def list_models(self, provider_id: str) -> list[ModelInfo]:
+        config = await self._get_by_id_full(provider_id)
+        adapter = _get_adapter(config)
+        try:
+            try:
+                raw_ids = await adapter.list_models()
+            except ProviderError:
+                manual = config.extra.get("manual_models")
+                if manual:
+                    raw_ids = manual
+                else:
+                    raise
+            if config.kind == ProviderKind.OPENROUTER and isinstance(adapter, OpenRouterAdapter):
+                caps = adapter.reasoning_by_id()
+                return [_openrouter_model_info(mid, caps.get(mid)) for mid in raw_ids]
+            return [
+                ModelInfo(id=model_id, reasoning_style=classify(config.kind, model_id))
+                for model_id in raw_ids
+            ]
+        finally:
+            await adapter.aclose()
+
+    async def list_endpoints(self, provider_id: str) -> list[dict]:
+        config = await self._get_by_id_full(provider_id)
+        if config.kind != ProviderKind.OPENROUTER:
+            return []
+        adapter = _get_adapter(config)
+        try:
+            if isinstance(adapter, OpenRouterAdapter):
+                return await adapter.list_endpoints()
+            return []
+        finally:
+            await adapter.aclose()
+
+    async def chat(self, request: ChatRequest) -> ChatResponse:
+        """Route a chat request to the correct provider adapter.
+
+        Automatically retries once, dropping a parameter the provider rejected:
+        - reasoning_effort — the model-id heuristic can't know every proxy/gateway's real
+          capabilities (a 'gpt-5'-named alias may not accept reasoning_effort at all).
+        - temperature — models like o1/o3/gpt-5 only accept their built-in default.
+        """
+        config = await self._get_by_id_full(request.provider_id)
+        if request.model_id:
+            config = config.model_copy(update={"model_id": request.model_id})
+        adapter = _get_adapter(config)
+        try:
+            try:
+                return await adapter.chat(request)
+            except ProviderError as e:
+                msg = (e.message or "").lower()
+                if request.reasoning_effort is not None and "reasoning_effort" in msg:
+                    logger.warning(
+                        "Provider %s/%s rejected reasoning_effort=%s — retrying without it",
+                        request.provider_id,
+                        config.model_id,
+                        request.reasoning_effort,
+                    )
+                    return await adapter.chat(request.model_copy(update={"reasoning_effort": None}))
+                if request.temperature is not None and "temperature" in msg:
+                    logger.warning(
+                        "Provider %s/%s rejected temperature=%s — retrying without temperature",
+                        request.provider_id,
+                        config.model_id,
+                        request.temperature,
+                    )
+                    return await adapter.chat(request.model_copy(update={"temperature": None}))
+                raise
+        finally:
+            await adapter.aclose()
+
+    async def chat_stream_events(self, request: ChatRequest) -> AsyncGenerator[dict, None]:
+        """Stream chat events from the correct provider adapter.
+
+        Yields typed events: {"type": "thinking"|"content"|"done", ...}.
+        Falls back to a single content + done for adapters that don't support
+        native streaming.
+        """
+        config = await self._get_by_id_full(request.provider_id)
+        if request.model_id:
+            config = config.model_copy(update={"model_id": request.model_id})
+        adapter = _get_adapter(config)
+        try:
+            async for event in adapter.chat_stream_events(request):
+                yield event
+        finally:
+            await adapter.aclose()
+
+    async def chat_stream(self, request: ChatRequest) -> AsyncGenerator[str, None]:
+        """Stream tokens from the correct provider adapter.
+
+        Yields delta text strings. Falls back to yielding the full response as
+        a single chunk for adapters that don't support native streaming.
+        """
+        async for event in self.chat_stream_events(request):
+            if event["type"] == "content":
+                yield event["text"]
+
+    async def embed(self, request: EmbedRequest) -> EmbedResponse:
+        """Route an embedding request to the correct provider adapter.
+
+        Only OpenAI and Gemini support embeddings; Anthropic and DeepSeek raise
+        ProviderError with a clear message.
+        """
+        config = await self._get_by_id_full(request.provider_id)
+        if request.model_id:
+            config = config.model_copy(update={"model_id": request.model_id})
+        adapter = _get_adapter(config)
+        try:
+            return await adapter.embed(request)
+        finally:
+            await adapter.aclose()
+
+    async def list_embedding_models(self, provider_id: str) -> list[str]:
+        """Embedding model ids this provider's ACTUAL endpoint serves — never a hardcoded list.
+
+        Provider kind alone doesn't guarantee embeddings: an OpenAI-compatible base_url (e.g. a
+        DeepSeek endpoint registered as kind=openai) may only do chat and 404 on /v1/embeddings. We
+        enumerate the endpoint's own /v1/models and keep only its embedding models; [] means the
+        endpoint serves none, so the UI hides it. No blind probe — that would 404-spam chat-only
+        endpoints.
+        """
+        config = await self._get_by_id_full(provider_id)
+        kind = config.kind.value if hasattr(config.kind, "value") else str(config.kind)
+        if kind not in ("openai", "gemini"):
+            return []
+        adapter = _get_adapter(config)
+        try:
+            models = await adapter.list_embedding_models()
+        except Exception:  # noqa: BLE001 — endpoint/auth error ⇒ can't enumerate ⇒ treat as no embeddings
+            models = []
+        finally:
+            await adapter.aclose()
+        return sorted(models)
+
+    @staticmethod
+    def _row_to_config(row) -> ProviderConfig:
+        caps_raw = row["capabilities"] or "{}"
+        extra_raw = row["extra"] or "{}"
+        caps_dict = json.loads(caps_raw) if isinstance(caps_raw, str) else caps_raw
+        extra_dict = json.loads(extra_raw) if isinstance(extra_raw, str) else extra_raw
+        return ProviderConfig(
+            id=row["id"],
+            kind=ProviderKind(row["kind"]),
+            display_name=row["display_name"],
+            base_url=row["base_url"],
+            model_id=row["model_id"],
+            capabilities=ProviderCapabilities(**caps_dict),
+            extra=extra_dict,
+        )
