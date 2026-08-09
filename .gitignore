@@ -60,6 +60,7 @@ agent_eval_harness/scripts/*.preview.md
 
 # App data / local DB
 .database/
+backend/graphs/
 
 # Working data: CardDemo corpus, generated docs, tickets, plans — local only
 emt_data/

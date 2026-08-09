@@ -425,6 +425,44 @@ CREATE TABLE IF NOT EXISTS source_parse_diagnostics (
 CREATE INDEX IF NOT EXISTS ix_parse_diag_snap ON source_parse_diagnostics(snapshot_id);
         """,
     },
+    {
+        "version": 4,
+        "description": "Add doc_code_relation_comparisons and doc_code_relation_evidence for Structural Link v1",
+        "sql": """
+CREATE TABLE IF NOT EXISTS doc_code_relation_comparisons (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  cluster_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  doc_assertion_id INTEGER,
+  side TEXT,
+  predicate TEXT NOT NULL,
+  subject_key TEXT,
+  object_key TEXT,
+  qualifier_key TEXT,
+  endpoint_verdict TEXT NOT NULL,
+  multiplicity_verdict TEXT NOT NULL,
+  doc_count INTEGER,
+  code_count INTEGER,
+  eligibility TEXT NOT NULL,
+  reason TEXT,
+  comparator_version TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS doc_code_relation_evidence (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  comparison_id INTEGER NOT NULL,
+  occurrence_key TEXT,
+  rel_path TEXT,
+  line_start INTEGER,
+  line_end INTEGER,
+  source_store TEXT,
+  match_kind TEXT
+);
+
+CREATE INDEX IF NOT EXISTS ix_dcrc ON doc_code_relation_comparisons(cluster_id, snapshot_id);
+        """,
+    },
 ]
 
 TARGET_VERSION = len(_MIGRATIONS) - 1

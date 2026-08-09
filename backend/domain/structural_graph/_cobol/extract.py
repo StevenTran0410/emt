@@ -91,9 +91,20 @@ class _MainListener(Cobol85Listener):
                 )
 
 
-class _SilentErrorListener(ErrorListener):
+class _CountingErrorListener(ErrorListener):
+    def __init__(self) -> None:
+        self.count = 0
+        self.first: str | None = None
+
     def syntaxError(self, recognizer: Any, offendingSymbol: Any, line: int, column: int, msg: str, e: Any) -> None:
-        pass
+        self.count += 1
+        if self.first is None:
+            self.first = f"L{line}:{column} {msg[:120]}"
+
+
+class _SilentErrorListener(_CountingErrorListener):
+    """Backward compatible alias for _CountingErrorListener."""
+    pass
 
 
 def _run_main_grammar_pass(
@@ -131,7 +142,7 @@ def extract_cobol_facts(content: str) -> CobolExtractionResult:
         return CobolExtractionResult(program_id=None, calls=[], copies=[])
 
     norm = normalize_cobol_text(content)
-    silent_listener = _SilentErrorListener()
+    silent_listener = _CountingErrorListener()
 
     program_id: str | None = None
     calls: list[CobolCallFact] = []
@@ -223,14 +234,19 @@ class CobolEnrichmentListener(Cobol85Listener):
     def __init__(self, rel_path: str):
         self.rel_path = rel_path
         self.facts: list[dict[str, Any]] = []
-        self.program_id = "MAIN"
+        self.program_id: str | None = None
+        self.calls: list[CobolCallFact] = []
         self.current_section: str | None = None
         self.current_paragraph: str | None = None
         self.occurrence_counts: dict[str, int] = {}
-        self.branch_count = 0
-        self.loop_count = 0
-        self.handler_count = 0
-        self.exec_count = 0
+        self.ordinal_counts: dict[tuple[str, str], int] = {}
+        self.has_exec_sql = False
+        self.has_exec_cics = False
+
+    def _next_ordinal(self, kind: str, parent_key: str) -> int:
+        k = (kind, parent_key)
+        self.ordinal_counts[k] = self.ordinal_counts.get(k, 0) + 1
+        return self.ordinal_counts[k]
 
     def _add_fact(
         self,
@@ -262,11 +278,12 @@ class CobolEnrichmentListener(Cobol85Listener):
         )
 
     def _get_current_parent_key(self) -> str:
+        pid = self.program_id or "MAIN"
         if self.current_paragraph:
-            return f"paragraph/{self.program_id}.{self.current_paragraph}"
+            return f"paragraph/{pid}.{self.current_paragraph}"
         elif self.current_section:
-            return f"section/{self.program_id}.{self.current_section}"
-        return f"program/{self.program_id}"
+            return f"section/{pid}.{self.current_section}"
+        return f"program/{pid}"
 
     def enterProgramIdParagraph(self, ctx: Any) -> None:
         if ctx.programName():
@@ -283,6 +300,40 @@ class CobolEnrichmentListener(Cobol85Listener):
                 ctx.stop.line,
             )
 
+    def enterCallStatement(self, ctx: Any) -> None:
+        lit = ctx.literal()
+        ident = ctx.identifier()
+        callee = None
+        res_method = "literal"
+        if lit:
+            callee = lit.getText().strip("'\"").upper()
+        elif ident:
+            callee = ident.getText().strip("'\"").upper()
+            res_method = "dynamic"
+
+        if callee:
+            self.calls.append(
+                CobolCallFact(
+                    callee=callee,
+                    line=ctx.start.line,
+                    resolution_method="cobol_call_literal" if lit else "dynamic_call",
+                )
+            )
+            pid = self.program_id or "MAIN"
+            curr_p = self.current_paragraph or "MAIN"
+            key = f"call/{pid}.{curr_p}.{callee}"
+            parent = self._get_current_parent_key()
+            self._add_fact(
+                "call",
+                key,
+                parent,
+                callee,
+                None,
+                {"resolution": res_method},
+                ctx.start.line,
+                ctx.stop.line,
+            )
+
     def enterProcedureSection(self, ctx: Any) -> None:
         if ctx.procedureSectionHeader() and ctx.procedureSectionHeader().sectionName():
             sec_name = (
@@ -290,11 +341,12 @@ class CobolEnrichmentListener(Cobol85Listener):
             )
             self.current_section = sec_name
             self.current_paragraph = None
-            key = f"section/{self.program_id}.{sec_name}"
+            pid = self.program_id or "MAIN"
+            key = f"section/{pid}.{sec_name}"
             self._add_fact(
                 "section",
                 key,
-                f"program/{self.program_id}",
+                f"program/{pid}",
                 sec_name,
                 None,
                 {},
@@ -306,11 +358,12 @@ class CobolEnrichmentListener(Cobol85Listener):
         if ctx.paragraphName():
             p_name = ctx.paragraphName().getText().strip("'\"").upper()
             self.current_paragraph = p_name
-            key = f"paragraph/{self.program_id}.{p_name}"
+            pid = self.program_id or "MAIN"
+            key = f"paragraph/{pid}.{p_name}"
             parent = (
-                f"section/{self.program_id}.{self.current_section}"
+                f"section/{pid}.{self.current_section}"
                 if self.current_section
-                else f"program/{self.program_id}"
+                else f"program/{pid}"
             )
             self._add_fact(
                 "paragraph",
@@ -349,11 +402,12 @@ class CobolEnrichmentListener(Cobol85Listener):
         )
 
     def enterPerformType(self, ctx: Any) -> None:
-        self.loop_count += 1
+        parent = self._get_current_parent_key()
+        n = self._next_ordinal("loop", parent)
         cond_text = ctx.getText()
         curr_p = self.current_paragraph or "MAIN"
-        key = f"loop/{self.program_id}.{curr_p}#{self.loop_count}"
-        parent = self._get_current_parent_key()
+        pid = self.program_id or "MAIN"
+        key = f"loop/{pid}.{curr_p}#{n}"
         self._add_fact(
             "loop",
             key,
@@ -368,11 +422,12 @@ class CobolEnrichmentListener(Cobol85Listener):
     def enterSelectClause(self, ctx: Any) -> None:
         if ctx.fileName():
             f_name = ctx.fileName().getText().strip("'\"").upper()
-            key = f"file/{self.program_id}.{f_name}"
+            pid = self.program_id or "MAIN"
+            key = f"file/{pid}.{f_name}"
             self._add_fact(
                 "file_def",
                 key,
-                f"program/{self.program_id}",
+                f"program/{pid}",
                 f_name,
                 None,
                 {},
@@ -383,11 +438,12 @@ class CobolEnrichmentListener(Cobol85Listener):
     def enterFileDescriptionEntry(self, ctx: Any) -> None:
         if ctx.fileName():
             fd_name = ctx.fileName().getText().strip("'\"").upper()
-            key = f"file/{self.program_id}.{fd_name}"
+            pid = self.program_id or "MAIN"
+            key = f"file/{pid}.{fd_name}"
             self._add_fact(
                 "fd",
                 key,
-                f"program/{self.program_id}",
+                f"program/{pid}",
                 fd_name,
                 None,
                 {},
@@ -407,11 +463,12 @@ class CobolEnrichmentListener(Cobol85Listener):
             if ctx.dataName()
             else "FILLER"
         )
+        pid = self.program_id or "MAIN"
         fact_type = "record" if level in (1, 77) else "field"
         key = (
-            f"record/{self.program_id}.{name}"
+            f"record/{pid}.{name}"
             if fact_type == "record"
-            else f"field/{self.program_id}.{name}"
+            else f"field/{pid}.{name}"
         )
 
         attrs: dict[str, Any] = {"level": level}
@@ -428,7 +485,7 @@ class CobolEnrichmentListener(Cobol85Listener):
         self._add_fact(
             fact_type,
             key,
-            f"program/{self.program_id}",
+            f"program/{pid}",
             name,
             None,
             attrs,
@@ -437,11 +494,12 @@ class CobolEnrichmentListener(Cobol85Listener):
         )
 
     def enterIfStatement(self, ctx: Any) -> None:
-        self.branch_count += 1
-        curr_p = self.current_paragraph or "MAIN"
-        key = f"branch/{self.program_id}.{curr_p}#{self.branch_count}"
-        cond_text = ctx.condition().getText() if ctx.condition() else ""
         parent = self._get_current_parent_key()
+        n = self._next_ordinal("branch", parent)
+        curr_p = self.current_paragraph or "MAIN"
+        pid = self.program_id or "MAIN"
+        key = f"branch/{pid}.{curr_p}#{n}"
+        cond_text = ctx.condition().getText() if ctx.condition() else ""
         self._add_fact(
             "branch",
             key,
@@ -454,11 +512,12 @@ class CobolEnrichmentListener(Cobol85Listener):
         )
 
     def enterEvaluateStatement(self, ctx: Any) -> None:
-        self.branch_count += 1
-        curr_p = self.current_paragraph or "MAIN"
-        key = f"branch/{self.program_id}.{curr_p}#{self.branch_count}"
-        eval_text = ctx.getText()
         parent = self._get_current_parent_key()
+        n = self._next_ordinal("branch", parent)
+        curr_p = self.current_paragraph or "MAIN"
+        pid = self.program_id or "MAIN"
+        key = f"branch/{pid}.{curr_p}#{n}"
+        eval_text = ctx.getText()
         self._add_fact(
             "branch",
             key,
@@ -471,9 +530,10 @@ class CobolEnrichmentListener(Cobol85Listener):
         )
 
     def enterExecSqlStatement(self, ctx: Any) -> None:
-        self.exec_count += 1
+        self.has_exec_sql = True
         curr_p = self.current_paragraph or "MAIN"
-        key = f"exec_block/{self.program_id}.{curr_p}#{self.exec_count}"
+        pid = self.program_id or "MAIN"
+        key = f"exec_block/{pid}.{curr_p}.sql"
         parent = self._get_current_parent_key()
         self._add_fact(
             "exec_block",
@@ -487,9 +547,10 @@ class CobolEnrichmentListener(Cobol85Listener):
         )
 
     def enterExecCicsStatement(self, ctx: Any) -> None:
-        self.exec_count += 1
+        self.has_exec_cics = True
         curr_p = self.current_paragraph or "MAIN"
-        key = f"exec_block/{self.program_id}.{curr_p}#{self.exec_count}"
+        pid = self.program_id or "MAIN"
+        key = f"exec_block/{pid}.{curr_p}.cics"
         parent = self._get_current_parent_key()
         self._add_fact(
             "exec_block",
@@ -505,7 +566,8 @@ class CobolEnrichmentListener(Cobol85Listener):
     def enterGoToStatement(self, ctx: Any) -> None:
         target = ctx.getText().replace("GO TO", "").replace("GOTO", "").replace(".", "").strip().upper()
         curr_p = self.current_paragraph or "MAIN"
-        key = f"paragraph/{self.program_id}.{curr_p}"
+        pid = self.program_id or "MAIN"
+        key = f"paragraph/{pid}.{curr_p}"
         self._add_fact(
             "goto",
             key,
@@ -517,6 +579,40 @@ class CobolEnrichmentListener(Cobol85Listener):
             ctx.stop.line,
         )
 
+    def enterAtEndPhrase(self, ctx: Any) -> None:
+        self._emit_handler(ctx, "at_end")
+
+    def enterNotAtEndPhrase(self, ctx: Any) -> None:
+        self._emit_handler(ctx, "not_at_end")
+
+    def enterInvalidKeyPhrase(self, ctx: Any) -> None:
+        self._emit_handler(ctx, "invalid_key")
+
+    def enterNotInvalidKeyPhrase(self, ctx: Any) -> None:
+        self._emit_handler(ctx, "not_invalid_key")
+
+    def enterOnSizeErrorPhrase(self, ctx: Any) -> None:
+        self._emit_handler(ctx, "on_size_error")
+
+    def enterUseStatement(self, ctx: Any) -> None:
+        self._emit_handler(ctx, "declaratives")
+
+    def _emit_handler(self, ctx: Any, kind: str) -> None:
+        parent = self._get_current_parent_key()
+        n = self._next_ordinal("handler", parent)
+        curr_p = self.current_paragraph or "MAIN"
+        pid = self.program_id or "MAIN"
+        self._add_fact(
+            "handler",
+            f"handler/{pid}.{curr_p}#{n}",
+            parent,
+            kind.upper(),
+            None,
+            {"kind": kind},
+            ctx.start.line,
+            ctx.stop.line,
+        )
+
 
 def extract_cobol_enrichment_facts(
     content: str, rel_path: str
@@ -524,26 +620,34 @@ def extract_cobol_enrichment_facts(
     """Extract full sub-program facts and diagnostic record from COBOL code using ANTLR."""
     import time
     t0 = time.perf_counter()
+    empty_diag = {
+        "rel_path": rel_path,
+        "language": "cobol",
+        "status": "ok",
+        "error_count": 0,
+        "first_error": None,
+        "elapsed_ms": 0,
+        "extractor_ver": "1.0.0",
+        "has_exec_sql": False,
+        "has_exec_cics": False,
+    }
     if not content or not content.strip():
-        diag = {
-            "rel_path": rel_path,
-            "language": "cobol",
-            "status": "ok",
-            "error_count": 0,
-            "first_error": None,
-            "elapsed_ms": 0,
-            "extractor_ver": "1.0.0",
-        }
-        return [], diag
+        return [], empty_diag
 
     norm = normalize_cobol_text(content)
 
     # Preprocessor pass for COPY spans
     copy_spans: list[tuple[int, int]] = []
+    err_p = _CountingErrorListener()
     try:
         lexer_p = Cobol85PreprocessorLexer(InputStream(norm))
+        lexer_p.removeErrorListeners()
+        lexer_p.addErrorListener(err_p)
+
         tokens_p = CommonTokenStream(lexer_p)
         parser_p = Cobol85PreprocessorParser(tokens_p)
+        parser_p.removeErrorListeners()
+        parser_p.addErrorListener(err_p)
         parser_p._interp.predictionMode = PredictionMode.SLL
         tree_p = parser_p.startRule()
         listener_p = _PreprocessorListener()
@@ -559,39 +663,191 @@ def extract_cobol_enrichment_facts(
                 norm_list[i] = " "
     norm_no_copy = "".join(norm_list)
 
-    silent_listener = _SilentErrorListener()
+    err_m = _CountingErrorListener()
     facts: list[dict[str, Any]] = []
     status = "ok"
+    has_exec_sql = False
+    has_exec_cics = False
 
     try:
         lexer = Cobol85Lexer(InputStream(norm_no_copy))
         lexer.removeErrorListeners()
-        lexer.addErrorListener(silent_listener)
+        lexer.addErrorListener(err_m)
 
         tokens = CommonTokenStream(lexer)
         parser = Cobol85Parser(tokens)
         parser.removeErrorListeners()
-        parser.addErrorListener(silent_listener)
+        parser.addErrorListener(err_m)
         parser._interp.predictionMode = PredictionMode.SLL
 
         tree = parser.startRule()
         listener = CobolEnrichmentListener(rel_path)
         ParseTreeWalker().walk(listener, tree)
         facts = listener.facts
-    except Exception:
+        has_exec_sql = listener.has_exec_sql
+        has_exec_cics = listener.has_exec_cics
+
+        total_err_count = err_p.count + err_m.count
+        first_err = err_m.first or err_p.first
+        if total_err_count > 0:
+            status = "partial" if len(facts) > 0 else "failed"
+    except Exception as ex:
         status = "failed"
+        total_err_count = err_p.count + err_m.count + 1
+        first_err = err_m.first or err_p.first or str(ex)
 
     t1 = time.perf_counter()
     diag = {
         "rel_path": rel_path,
         "language": "cobol",
         "status": status,
-        "error_count": 0,
-        "first_error": None,
+        "error_count": total_err_count,
+        "first_error": first_err,
         "elapsed_ms": int((t1 - t0) * 1000),
         "extractor_ver": "1.0.0",
+        "has_exec_sql": has_exec_sql,
+        "has_exec_cics": has_exec_cics,
     }
     return facts, diag
+
+
+def extract_cobol_all(
+    content: str, rel_path: str
+) -> tuple[CobolExtractionResult, list[dict[str, Any]], dict[str, Any]]:
+    """Parse COBOL ONCE, walk tree with both _MainListener and CobolEnrichmentListener.
+
+    Returns (edge_result, enrichment_facts, diag).
+    """
+    import time
+
+    t0 = time.perf_counter()
+    empty_diag = {
+        "rel_path": rel_path,
+        "language": "cobol",
+        "status": "ok",
+        "error_count": 0,
+        "first_error": None,
+        "elapsed_ms": 0,
+        "extractor_ver": "1.0.0",
+        "has_exec_sql": False,
+        "has_exec_cics": False,
+    }
+    if not content or not content.strip():
+        return CobolExtractionResult(program_id=None, calls=[], copies=[]), [], empty_diag
+
+    norm = normalize_cobol_text(content)
+    err_p = _CountingErrorListener()
+
+    program_id: str | None = None
+    calls: list[CobolCallFact] = []
+    copies: list[CobolCopyFact] = []
+    facts: list[dict[str, Any]] = []
+    antlr_success = False
+    status = "ok"
+    has_exec_sql = False
+    has_exec_cics = False
+
+    # 1. ANTLR Preprocessor Pass for COPY statements (ONCE)
+    copy_spans: list[tuple[int, int]] = []
+    try:
+        lexer_p = Cobol85PreprocessorLexer(InputStream(norm))
+        lexer_p.removeErrorListeners()
+        lexer_p.addErrorListener(err_p)
+
+        tokens_p = CommonTokenStream(lexer_p)
+        parser_p = Cobol85PreprocessorParser(tokens_p)
+        parser_p.removeErrorListeners()
+        parser_p.addErrorListener(err_p)
+        parser_p._interp.predictionMode = PredictionMode.SLL
+
+        tree_p = parser_p.startRule()
+        listener_p = _PreprocessorListener()
+        ParseTreeWalker().walk(listener_p, tree_p)
+
+        copies = listener_p.copies
+        copy_spans = listener_p.copy_spans
+        antlr_success = True
+    except Exception:
+        pass
+
+    # Replace COPY statement spans with spaces to preserve line numbers
+    norm_list = list(norm)
+    for start, stop in copy_spans:
+        for i in range(start, min(stop + 1, len(norm_list))):
+            if norm_list[i] != "\n":
+                norm_list[i] = " "
+    norm_no_copy = "".join(norm_list)
+
+    # 2. ANTLR Main Pass (ONCE, tree walked by both listeners)
+    upper_norm = norm_no_copy.upper()
+    err_m = _CountingErrorListener()
+    try:
+        lexer_m = Cobol85Lexer(InputStream(norm_no_copy))
+        lexer_m.removeErrorListeners()
+        lexer_m.addErrorListener(err_m)
+
+        tokens_m = CommonTokenStream(lexer_m)
+        parser_m = Cobol85Parser(tokens_m)
+        parser_m.removeErrorListeners()
+        parser_m.addErrorListener(err_m)
+        parser_m._interp.predictionMode = PredictionMode.SLL
+
+        tree_m = parser_m.startRule()
+
+        # Single walk: CobolEnrichmentListener extracts PROGRAM-ID, CALL facts, and enrichment facts
+        enrich_listener = CobolEnrichmentListener(rel_path)
+        ParseTreeWalker().walk(enrich_listener, tree_m)
+
+        if enrich_listener.program_id or enrich_listener.calls:
+            program_id = enrich_listener.program_id
+            calls = enrich_listener.calls
+            antlr_success = True
+
+        facts = enrich_listener.facts
+        has_exec_sql = enrich_listener.has_exec_sql
+        has_exec_cics = enrich_listener.has_exec_cics
+
+        total_err_count = err_p.count + err_m.count
+        first_err = err_m.first or err_p.first
+        if total_err_count > 0:
+            status = "partial" if len(facts) > 0 else "failed"
+    except Exception as ex:
+        status = "failed"
+        total_err_count = err_p.count + err_m.count + 1
+        first_err = err_m.first or err_p.first or str(ex)
+
+    # 3. Regex Fallback (kept intact to preserve exact edge results)
+    want_pid = program_id is None and "PROGRAM-ID" in upper_norm
+    want_calls = not calls and "CALL" in upper_norm
+    want_copies = not copies and "COPY" in upper_norm
+    if not antlr_success or want_pid or want_calls or want_copies or status in ("partial", "failed"):
+        fb = _extract_cobol_facts_regex_fallback(norm)
+        recovered: list[str] = []
+        if program_id is None and fb.program_id:
+            program_id = fb.program_id
+            recovered.append("program-id")
+        if not calls and program_id is not None and fb.calls:
+            calls = fb.calls
+            recovered.append(f"{len(fb.calls)} call(s)")
+        if not copies and fb.copies:
+            copies = fb.copies
+            recovered.append(f"{len(fb.copies)} copy(s)")
+        if recovered:
+            logger.debug("[cobol] regex fallback recovered %s ANTLR missed", ", ".join(recovered))
+
+    t1 = time.perf_counter()
+    diag = {
+        "rel_path": rel_path,
+        "language": "cobol",
+        "status": status,
+        "error_count": total_err_count,
+        "first_error": first_err,
+        "elapsed_ms": int((t1 - t0) * 1000),
+        "extractor_ver": "1.0.0",
+        "has_exec_sql": has_exec_sql,
+        "has_exec_cics": has_exec_cics,
+    }
+    return CobolExtractionResult(program_id=program_id, calls=calls, copies=copies), facts, diag
 
 
 def _extract_cobol_facts_regex_fallback(norm: str) -> CobolExtractionResult:

@@ -314,7 +314,11 @@ def build_assertions_and_projection(
                     if not called_name:
                         continue
 
-                    site_list = [s.strip() for s in call_sites_cell.split(",") if s.strip()]
+                    site_list = [
+                        re.sub(r"\s*\(.*?\)", "", s).strip()
+                        for s in call_sites_cell.split(",")
+                        if s.strip()
+                    ]
                     site_count = len(site_list) if call_sites_cell else 0
 
                     res_u = res_cell.upper()

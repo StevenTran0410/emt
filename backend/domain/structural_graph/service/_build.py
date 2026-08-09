@@ -64,11 +64,10 @@ class _BuildMixin:
         if req.force_rebuild:
             await db.execute("DELETE FROM structural_graph_edges WHERE snapshot_id=?", (req.snapshot_id,))
             await db.execute("DELETE FROM structural_graph_summaries WHERE snapshot_id=?", (req.snapshot_id,))
+            await db.execute("DELETE FROM source_facts WHERE snapshot_id=?", (req.snapshot_id,))
+            await db.execute("DELETE FROM source_parse_diagnostics WHERE snapshot_id=?", (req.snapshot_id,))
             if _SYMBOL_GRAPH_BUILDER_ENABLED:
                 await db.execute("DELETE FROM symbol_graph_edges WHERE snapshot_id=?", (req.snapshot_id,))
-            if _CODEGRAPH_ENRICH_ENABLED:
-                await db.execute("DELETE FROM source_facts WHERE snapshot_id=?", (req.snapshot_id,))
-                await db.execute("DELETE FROM source_parse_diagnostics WHERE snapshot_id=?", (req.snapshot_id,))
         else:
             async with db.execute(
                 "SELECT 1 FROM structural_graph_summaries WHERE snapshot_id=? LIMIT 1",
@@ -149,10 +148,12 @@ class _BuildMixin:
         cobol_program_index: dict[str, list[str]] = {}
         copybook_index: dict[str, list[str]] = {}
         cobol_facts_cache: dict[str, Any] = {}
+        cobol_enrich_cache: dict[str, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
         if _COBOL_JCL_GRAPH_ENABLED:
             from .._cobol import (
                 build_copybook_index,
                 build_program_index,
+                extract_cobol_all,
                 extract_cobol_facts,
             )
             extracted_program_ids: dict[str, str | None] = {}
@@ -162,7 +163,13 @@ class _BuildMixin:
                     if src_f.exists() and src_f.is_file():
                         c_content = read_utf8_lenient(src_f)
                         if c_content:
-                            res = extract_cobol_facts(c_content)
+                            if _CODEGRAPH_ENRICH_ENABLED:
+                                res, enrich_facts, diag = extract_cobol_all(
+                                    c_content, r["rel_path"]
+                                )
+                                cobol_enrich_cache[r["rel_path"]] = (enrich_facts, diag)
+                            else:
+                                res = extract_cobol_facts(c_content)
                             extracted_program_ids[r["rel_path"]] = res.program_id
                             cobol_facts_cache[r["rel_path"]] = res
 
@@ -292,7 +299,11 @@ class _BuildMixin:
                     continue
 
                 if lang == "cobol":
-                    facts, diag = extract_cobol_enrichment_facts(c_text, rel_path)
+                    cached_enrich = cobol_enrich_cache.get(rel_path)
+                    if cached_enrich is not None:
+                        facts, diag = cached_enrich
+                    else:
+                        facts, diag = extract_cobol_enrichment_facts(c_text, rel_path)
                     for f in facts:
                         _fact_rows.append(
                             (
@@ -326,19 +337,20 @@ class _BuildMixin:
                             now,
                         )
                     )
-                    _diag_rows.append(
-                        (
-                            req.snapshot_id,
-                            rel_path,
-                            "cobol",
-                            "skipped_unsupported",
-                            0,
-                            "EXEC SQL/CICS content parsing",
-                            0,
-                            "1.0.0",
-                            now,
+                    if diag.get("has_exec_sql") or diag.get("has_exec_cics"):
+                        _diag_rows.append(
+                            (
+                                req.snapshot_id,
+                                rel_path,
+                                "cobol",
+                                "skipped_unsupported",
+                                0,
+                                "EXEC SQL/CICS content parsing",
+                                0,
+                                "1.0.0",
+                                now,
+                            )
                         )
-                    )
                 elif lang == "jcl":
                     facts, diag = extract_jcl_enrichment_facts(c_text, rel_path)
                     for f in facts:

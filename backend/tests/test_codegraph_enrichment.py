@@ -1,8 +1,8 @@
-"""Tests for TICKET_CodeGraph_Enrichment.md (Sub-program COBOL facts, ANTLR JCL parser, source_facts & diagnostics)."""
+"""Tests for CodeGraph Enrichment (Sub-program COBOL facts, ANTLR JCL parser, source_facts & diagnostics)."""
 import re
 import pytest
 
-from domain.structural_graph._cobol.extract import extract_cobol_enrichment_facts
+from domain.structural_graph._cobol.extract import extract_cobol_all, extract_cobol_enrichment_facts
 from domain.structural_graph._jcl.extract import extract_jcl_enrichment_facts
 
 
@@ -47,6 +47,91 @@ def test_cobol_enrichment_facts_structure():
 
     program_fact = [f for f in facts if f["fact_type"] == "program"][0]
     assert program_fact["name"] == "TESTPROG"
+
+
+def test_cobol_ordinal_scoped_per_paragraph():
+    """BLOCKER 1: Verify branch ordinal (#n) is scoped per paragraph, not global."""
+    content = """
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. ORDPROG.
+       PROCEDURE DIVISION.
+       1000-FIRST-PARA.
+           IF X = 1
+               MOVE 2 TO X
+           END-IF.
+           GOBACK.
+       2000-SECOND-PARA.
+           IF Y = 1
+               MOVE 2 TO Y
+           END-IF.
+           GOBACK.
+    """
+    facts, diag = extract_cobol_enrichment_facts(content, "ORDPROG.cbl")
+
+    branch_facts = [f for f in facts if f["fact_type"] == "branch"]
+    assert len(branch_facts) == 2
+
+    # Both paragraphs must have #1 because ordinal counter resets per paragraph (parent_key)
+    keys = [f["semantic_key"] for f in branch_facts]
+    assert "branch/ORDPROG.1000-FIRST-PARA#1" in keys
+    assert "branch/ORDPROG.2000-SECOND-PARA#1" in keys
+
+
+def test_cobol_call_fact_emission():
+    """BLOCKER 2: Verify CALL statements produce fact_type='call' in source_facts."""
+    content = """
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. CALLPROG.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           CALL 'SUBPROG1'.
+           CALL 'SUBPROG2'.
+           GOBACK.
+    """
+    res, facts, diag = extract_cobol_all(content, "CALLPROG.cbl")
+
+    call_facts = [f for f in facts if f["fact_type"] == "call"]
+    assert len(call_facts) == 2
+    assert call_facts[0]["name"] == "SUBPROG1"
+    assert call_facts[1]["name"] == "SUBPROG2"
+    assert res.calls[0].callee == "SUBPROG1"
+    assert res.calls[1].callee == "SUBPROG2"
+
+
+def test_cobol_error_handler_emission():
+    """BLOCKER 4: Verify AT END phrase produces fact_type='handler'."""
+    content = """
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. HANDPROG.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           READ MY-FILE
+               AT END MOVE 'Y' TO EOF-FLAG
+           END-READ.
+           GOBACK.
+    """
+    facts, diag = extract_cobol_enrichment_facts(content, "HANDPROG.cbl")
+
+    handler_facts = [f for f in facts if f["fact_type"] == "handler"]
+    assert len(handler_facts) >= 1
+    assert handler_facts[0]["name"] == "AT_END"
+
+
+def test_cobol_counting_error_listener():
+    """BLOCKER 3: Verify syntax error sets status='partial' and error_count > 0."""
+    content = """
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. ERRPROG.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           IF ( ( ( (
+           GOBACK.
+    """
+    facts, diag = extract_cobol_enrichment_facts(content, "ERRPROG.cbl")
+
+    assert diag["status"] == "partial"
+    assert diag["error_count"] > 0
+    assert diag["first_error"] is not None
 
 
 def test_jcl_enrichment_facts_structure():

@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.app import router as app_router
+from api.doc_code_compare import router as doc_code_compare_router
 from api.doc_graph import router as doc_graph_router
 from api.external import router as external_router
 from api.gpu_reranker import router as gpu_reranker_router
@@ -101,6 +102,7 @@ def create_app() -> FastAPI:
     app.include_router(repo_map_router, prefix="/api/repo-map")
     app.include_router(structural_graph_router, prefix="/api/graph")
     app.include_router(doc_graph_router, prefix="/api/doc-graph")
+    app.include_router(doc_code_compare_router, prefix="/api/doc-code")
     app.include_router(retrieval_router, prefix="/api/retrieval")
     app.include_router(external_router, prefix="/api/external")
 

@@ -192,10 +192,13 @@ class SyncEngineService:
                 await _update_status(snapshot_id, SnapshotStatus.SYNCING)
 
                 if not (Path(path) / ".git").exists():
-                    if not remote_url:
-                        # Non-git local folder flow: snapshot is a filesystem point-in-time marker.
+                    # A pre-populated folder without .git is a local corpus, not a clone
+                    # target — cloning into it always fails ("destination path already
+                    # exists and is not an empty directory"). Use the files as-is.
+                    dest = Path(path)
+                    if not remote_url or (dest.exists() and any(dest.iterdir())):
                         await _update_status(snapshot_id, SnapshotStatus.READY, commit_hash=None)
-                        logger.info(f"Snapshot {snapshot_id} ready (non-git folder)")
+                        logger.info(f"Snapshot {snapshot_id} ready (local folder, no clone)")
                         return
                     env = await _get_ssh_env() if is_ssh_url(remote_url) else os.environ.copy()
 
