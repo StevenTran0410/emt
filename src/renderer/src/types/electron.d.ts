@@ -644,6 +644,93 @@ export interface DocGraphClusterSummary {
   mismatch_count: number
 }
 
+export interface DocCodeUndocumentedItem {
+  key: string
+  rel_path: string
+  line_start: number
+  line_end: number
+  name: string
+}
+
+export interface DocCodeMissingItem {
+  key: string
+  display_name: string
+  provenance: any
+}
+
+export interface TypeComparisonResult {
+  type: 'program' | 'job' | 'step' | 'dd' | 'dataset'
+  doc_count: number
+  code_count: number
+  matched: number
+  undocumented: DocCodeUndocumentedItem[]
+  missing: DocCodeMissingItem[]
+  unknown: DocCodeMissingItem[]
+}
+
+export interface DocCodeCompareResult {
+  cluster_id: string
+  snapshot_id: string
+  per_type: TypeComparisonResult[]
+  not_assessed: string[]
+  eligibility: {
+    authoritative: boolean
+    reason: string
+  }
+  summary: {
+    matched: number
+    undocumented: number
+    missing: number
+    unknown: number
+  }
+}
+
+export interface RelationEvidenceItem {
+  occurrence_key?: string | null
+  rel_path?: string | null
+  line_start?: number | null
+  line_end?: number | null
+  source_store?: string | null
+  match_kind?: string | null
+}
+
+export interface RelationComparisonDetail {
+  doc_assertion_id?: number | null
+  side?: string | null
+  subject_key: string
+  object_key: string
+  endpoint_verdict: 'MATCH' | 'DOC_ONLY' | 'CODE_ONLY' | 'UNKNOWN'
+  multiplicity_verdict: 'EXACT_SITE_MATCH' | 'COUNT_ONLY_MATCH' | 'COUNT_MISMATCH' | 'NOT_APPLICABLE' | 'UNKNOWN'
+  doc_count: number
+  code_count: number
+  eligibility: string
+  reason: string
+  evidence: RelationEvidenceItem[]
+}
+
+export interface PredicateRelationResult {
+  predicate: string
+  matched: number
+  doc_only: number
+  code_only: number
+  unknown: number
+  details: RelationComparisonDetail[]
+}
+
+export interface DocCodeRelationCompareResult {
+  cluster_id: string
+  snapshot_id: string
+  status: 'OK' | 'STALE_INPUT' | 'UNBOUND'
+  per_predicate: PredicateRelationResult[]
+  not_assessed: string[]
+  summary: {
+    matched: number
+    doc_only: number
+    code_only: number
+    unknown: number
+  }
+}
+
 declare global {
   interface Window {
     api: {
@@ -782,6 +869,10 @@ declare global {
         buildStream: (body: { files: string[]; force_rebuild?: boolean; llm_enabled?: boolean }) => Promise<{ ok: boolean }>
         onStreamEvent: (handler: (evt: any) => void) => void
         offStreamEvent: (handler: (evt: any) => void) => void
+      }
+      docCode: {
+        compare: (body: { cluster_id: string; snapshot_id: string }) => Promise<DocCodeCompareResult>
+        compareRelations: (body: { cluster_id: string; snapshot_id: string }) => Promise<DocCodeRelationCompareResult>
       }
       query: {
         exportCsv: (csv: string, defaultName: string) => Promise<{ saved: boolean; file_path: string | null }>

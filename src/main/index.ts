@@ -21,6 +21,7 @@ import { registerGpuRerankerHandlers } from './api/gpuReranker.api'
 import { registerLocalEmbeddingHandlers } from './api/localEmbedding.api'
 import { registerFolderHandlers } from './api/folder.api'
 import { registerDocGraphHandlers } from './api/docGraph.api'
+import { registerDocCodeCompareHandlers } from './api/docCodeCompare.api'
 import { registerAppHandlers } from './api/app.api'
 import { logger } from './shared/logger'
 
@@ -42,6 +43,7 @@ app.whenReady().then(async () => {
     registerLocalEmbeddingHandlers(client)
     registerFolderHandlers(client)
     registerDocGraphHandlers(client)
+    registerDocCodeCompareHandlers(client)
 
     createMainWindow()
     logger.info('Startup complete')

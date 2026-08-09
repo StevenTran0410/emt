@@ -91,6 +91,34 @@ class DocCodeCompareService:
                 code_by_type[ft].setdefault(skey, []).append(fact)
                 scope_rel_paths.add(fact["rel_path"])
 
+        # BLOCKER 2 FIX: Resolve expected scope source files independently of fact emission
+        expected_scope_files: set[str] = set()
+
+        async with db.execute(
+            "SELECT DISTINCT rel_path, name FROM source_facts WHERE snapshot_id=?",
+            (snapshot_id,),
+        ) as cur:
+            sf_rows = [dict(r) for r in await cur.fetchall()]
+
+        for r in sf_rows:
+            pname = (r.get("name") or "").strip().upper()
+            if pname in scope_programs or pname in scope_jobs:
+                expected_scope_files.add(r["rel_path"])
+
+        async with db.execute(
+            "SELECT rel_path FROM manifest_files WHERE snapshot_id=?",
+            (snapshot_id,),
+        ) as cur:
+            mf_rows = [dict(r) for r in await cur.fetchall()]
+
+        for r in mf_rows:
+            rp = r["rel_path"]
+            base_name = rp.rsplit("/", 1)[-1].rsplit(".", 1)[0].upper()
+            if base_name in scope_programs or base_name in scope_jobs:
+                expected_scope_files.add(rp)
+
+        all_expected_files = expected_scope_files | scope_rel_paths
+
         # Organize doc nodes by type
         doc_by_type: dict[str, dict[str, dict[str, Any]]] = {
             t: {} for t in ["program", "job", "step", "dd", "dataset"]
@@ -100,7 +128,7 @@ class DocCodeCompareService:
             if t in doc_by_type:
                 doc_by_type[t][node["id"]] = node
 
-        # 3. Check Eligibility Gate
+        # 3. Check Eligibility Gate for ALL expected scope files
         async with db.execute(
             "SELECT rel_path, status FROM source_parse_diagnostics WHERE snapshot_id=?",
             (snapshot_id,),
@@ -108,16 +136,16 @@ class DocCodeCompareService:
             diag_rows = [dict(r) for r in await cur.fetchall()]
 
         diag_map = {r["rel_path"]: r["status"] for r in diag_rows}
-        non_ok_scope_files = [p for p in scope_rel_paths if diag_map.get(p) != "ok"]
+        non_ok_scope_files = [p for p in all_expected_files if diag_map.get(p) != "ok"]
 
-        authoritative = len(scope_rel_paths) > 0 and len(non_ok_scope_files) == 0
-        if len(scope_rel_paths) == 0:
+        authoritative = len(all_expected_files) > 0 and len(non_ok_scope_files) == 0
+        if len(all_expected_files) == 0:
             eligibility_reason = "No source files found in snapshot matching cluster scope"
         elif authoritative:
             eligibility_reason = "All source files in cluster scope parsed with status ok"
         else:
             eligibility_reason = (
-                f"Source parse not authoritative ({len(non_ok_scope_files)} scope file(s) "
+                f"Source parse not authoritative ({len(non_ok_scope_files)} expected scope file(s) "
                 "have non-ok status or missing diagnostics)"
             )
 
@@ -261,10 +289,11 @@ class DocCodeCompareService:
             if r["node_type"] == "job"
         }
 
-        # 3. Fetch doc_graph_assertions
+        # 3. Fetch doc_graph_assertions (SHOULD-FIX 4: Include doc_id, doc_span, source_span)
         async with db.execute(
             """
-            SELECT id, side, predicate, subject, object, value, qualifiers
+            SELECT id, side, predicate, subject, object, value,
+                   qualifiers, doc_id, doc_span, source_span
             FROM doc_graph_assertions
             WHERE cluster_id=? AND predicate IN ('calls', 'copies', 'runs', 'binds_dd')
             """,
@@ -285,7 +314,7 @@ class DocCodeCompareService:
             diag_rows = [dict(r) for r in await cur.fetchall()]
         diag_map = {r["rel_path"]: r["status"] for r in diag_rows}
 
-        # Build subject_rel_path_map for BUG 2:
+        # Build subject_rel_path_map
         async with db.execute(
             """
             SELECT rel_path, fact_type, semantic_key, parent_key, name
@@ -307,7 +336,7 @@ class DocCodeCompareService:
             elif ft == "job" and sf.get("name"):
                 subject_rel_path_map[f"job/{sf['name'].strip().upper()}"] = rpath
 
-        # Group doc assertions by (side, predicate, subject, object) for BUG 4:
+        # Group doc assertions by (side, predicate, subject, object)
         doc_rel_map: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
         for a in doc_assertions:
             side = a["side"] or "DOC"
@@ -357,7 +386,7 @@ class DocCodeCompareService:
             doc_count = len(doc_items)
             code_count = len(code_items)
 
-            # BUG 2 FIX: Resolve subject source file path correctly when code_items is empty
+            # Resolve subject source file path
             if code_items:
                 sub_rel_path = code_items[0].rel_path
             else:
@@ -367,17 +396,17 @@ class DocCodeCompareService:
                 sub_rel_path is not None and diag_map.get(sub_rel_path) == "ok"
             )
 
-            # Determine endpoint_verdict
+            # BLOCKER 3 FIX: CODE_ONLY is UNKNOWN because doc-side extraction is unverified
             if doc_items and code_items:
                 endpoint_verdict = "MATCH"
             elif doc_items and not code_items:
                 endpoint_verdict = "DOC_ONLY" if is_auth else "UNKNOWN"
             elif code_items and not doc_items:
-                endpoint_verdict = "CODE_ONLY"
+                endpoint_verdict = "UNKNOWN"  # Non-authoritative doc extraction
             else:
                 endpoint_verdict = "UNKNOWN"
 
-            # BUG 3 & BUG 4 FIX: Site parsing and multiplicity/count logic
+            # BLOCKER 1 FIX & BUG 3/4 FIX: Site parsing and strict multiplicity/count logic
             multiplicity_verdict = "NOT_APPLICABLE"
             if pred == "calls":
                 doc_lines: list[int] = []
@@ -398,7 +427,8 @@ class DocCodeCompareService:
                         if isinstance(quals, dict) and "call_sites" in quals:
                             sites = quals["call_sites"]
                             for s in sites:
-                                m = re.search(r"L?0*(\d+)", str(s).strip())
+                                token = str(s).strip().split()[0]
+                                m = re.search(r"L?0*(\d+)", token)
                                 if m:
                                     doc_lines.append(int(m.group(1)))
 
@@ -407,10 +437,9 @@ class DocCodeCompareService:
                 if doc_lines:
                     doc_count = len(doc_lines)
                     if code_lines:
+                        # BLOCKER 1 FIX: Strict site matching (EXACT_SITE_MATCH or COUNT_MISMATCH)
                         if sorted(doc_lines) == sorted(code_lines):
                             multiplicity_verdict = "EXACT_SITE_MATCH"
-                        elif len(doc_lines) == len(code_lines):
-                            multiplicity_verdict = "COUNT_ONLY_MATCH"
                         else:
                             multiplicity_verdict = "COUNT_MISMATCH"
                     else:
@@ -428,7 +457,7 @@ class DocCodeCompareService:
                     doc_count = len(doc_items)
                     multiplicity_verdict = "NOT_APPLICABLE"
 
-            # Build evidence items
+            # Build evidence items (SHOULD-FIX 4: populate doc locator)
             evidence_items: list[RelationEvidenceItem] = []
             for ci in code_items:
                 evidence_items.append(

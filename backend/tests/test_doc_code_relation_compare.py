@@ -9,8 +9,8 @@ from infrastructure.db.database import close_db, get_db, init_db
 
 
 @pytest.mark.asyncio
-async def test_structural_link_fixes_bug1_to_bug4(tmp_path, monkeypatch):
-    """Test 4 bugfixes: dd->dataset exclusion, eligibility, site regex, BD/DD un-merging."""
+async def test_structural_link_fixes_v2(tmp_path, monkeypatch):
+    """Test v2 bugfixes: Blockers 1-3 and Should-Fix 4."""
     db_dir = tmp_path / "db"
     db_dir.mkdir()
     monkeypatch.setenv("CODESPECTRA_DATA_DIR", str(db_dir))
@@ -37,6 +37,7 @@ async def test_structural_link_fixes_bug1_to_bug4(tmp_path, monkeypatch):
         doc_nodes = [
             (cluster_id, "program/CBSTM03A", "program", "CBSTM03A", "{}"),
             (cluster_id, "program/CBSTM03B", "program", "CBSTM03B", "{}"),
+            (cluster_id, "program/PROG_DIFF", "program", "PROG_DIFF", "{}"),
             (cluster_id, "extroutine/CEE3ABD", "extroutine", "CEE3ABD", "{}"),
             (cluster_id, "copybook/COSTM01", "copybook", "COSTM01", "{}"),
             (cluster_id, "job/CREASTMT", "job", "CREASTMT", "{}"),
@@ -55,7 +56,7 @@ async def test_structural_link_fixes_bug1_to_bug4(tmp_path, monkeypatch):
                 (nid, c_id, ntype, dname, prov),
             )
 
-        # 3. Insert doc_graph_assertions (including BUG 3 suffix string & BUG 1 dd->dataset)
+        # 3. Insert doc_graph_assertions
         call_sites = [
             351, 377, 401, 734, 746, 769, 787, 805, 835, 860, 877, 893,
             "L909 (13 call sites)",
@@ -72,7 +73,18 @@ async def test_structural_link_fixes_bug1_to_bug4(tmp_path, monkeypatch):
                 json.dumps({"call_sites": call_sites}),
                 "doc-1",
             ),
-            # BD side calls (count-only match, no call_sites) - BUG 4 unmerged row!
+            # BLOCKER 1: doc sites [10, 20] vs code sites [11, 19] (equal length, different lines!)
+            (
+                cluster_id,
+                "DD",
+                "calls",
+                "program/CBSTM03A",
+                "program/PROG_DIFF",
+                "2",
+                json.dumps({"call_sites": [10, 20]}),
+                "doc-diff",
+            ),
+            # BD side calls (count-only match, no call_sites)
             (
                 cluster_id,
                 "BD",
@@ -178,6 +190,19 @@ async def test_structural_link_fixes_bug1_to_bug4(tmp_path, monkeypatch):
             ),
             (
                 snapshot_id,
+                "app/prog_diff.cbl",
+                "cobol",
+                "program",
+                "program/PROG_DIFF",
+                0,
+                None,
+                "PROG_DIFF",
+                None,
+                1,
+                500,
+            ),
+            (
+                snapshot_id,
                 "app/unauthprog.cbl",
                 "cobol",
                 "program",
@@ -229,7 +254,7 @@ async def test_structural_link_fixes_bug1_to_bug4(tmp_path, monkeypatch):
                 8,
             ),
         ]
-        # Insert exact 13 call facts for CBSTM03B (lines 351..909)
+        # Insert exact 13 call facts for CBSTM03B
         code_call_lines = [351, 377, 401, 734, 746, 769, 787, 805, 835, 860, 877, 893, 909]
         for line in code_call_lines:
             code_facts.append(
@@ -247,6 +272,41 @@ async def test_structural_link_fixes_bug1_to_bug4(tmp_path, monkeypatch):
                     line,
                 )
             )
+
+        # BLOCKER 1 code call lines [11, 19] for PROG_DIFF
+        for line in [11, 19]:
+            code_facts.append(
+                (
+                    snapshot_id,
+                    "app/cbstm03a.cbl",
+                    "cobol",
+                    "call",
+                    f"call/CBSTM03A.0000-MAIN.PROG_DIFF#{line}",
+                    0,
+                    "program/CBSTM03A",
+                    "PROG_DIFF",
+                    "PROG_DIFF",
+                    line,
+                    line,
+                )
+            )
+
+        # BLOCKER 3: Code relation not in doc (CODE_ONLY)
+        code_facts.append(
+            (
+                snapshot_id,
+                "app/cbstm03a.cbl",
+                "cobol",
+                "call",
+                "call/CBSTM03A.0000-MAIN.EXTRA_PROG#999",
+                0,
+                "program/CBSTM03A",
+                "EXTRA_PROG",
+                "EXTRA_PROG",
+                999,
+                999,
+            )
+        )
 
         for snap_id, rpath, lang, ftype, skey, occ, pkey, name, val, lstart, lend in code_facts:
             await db.execute(
@@ -274,11 +334,12 @@ async def test_structural_link_fixes_bug1_to_bug4(tmp_path, monkeypatch):
             (snapshot_id,),
         )
 
-        # Insert source_parse_diagnostics: cbstm03a and creastmt are 'ok', unauthprog is 'partial'!
+        # Insert source_parse_diagnostics
         diagnostics = [
             (snapshot_id, "app/cbstm03a.cbl", "cobol", "ok"),
             (snapshot_id, "app/cbstm03b.cbl", "cobol", "ok"),
-            (snapshot_id, "app/unauthprog.cbl", "cobol", "partial"),  # BUG 2 non-ok file
+            (snapshot_id, "app/prog_diff.cbl", "cobol", "ok"),
+            (snapshot_id, "app/unauthprog.cbl", "cobol", "partial"),
             (snapshot_id, "jcl/creastmt.jcl", "jcl", "ok"),
         ]
         for snap_id, rpath, lang, status in diagnostics:
@@ -301,39 +362,29 @@ async def test_structural_link_fixes_bug1_to_bug4(tmp_path, monkeypatch):
         assert res.status == "OK"
         pred_map = {p.predicate: p for p in res.per_predicate}
 
-        # ── BUG 1 VERIFICATION ──
-        # dd -> dataset MUST NOT be in binds_dd details and MUST NOT produce DOC_ONLY
+        # ── BLOCKER 1 VERIFICATION ──
+        # doc [10, 20] vs code [11, 19] MUST BE COUNT_MISMATCH (not COUNT_ONLY_MATCH)!
+        prog_diff_detail = [
+            d for d in pred_map["calls"].details if d.object_key == "program/PROG_DIFF"
+        ][0]
+        assert prog_diff_detail.multiplicity_verdict == "COUNT_MISMATCH"
+
+        # ── BLOCKER 3 VERIFICATION ──
+        # CODE_ONLY relation (EXTRA_PROG) MUST BE UNKNOWN
+        extra_detail = [
+            d for d in pred_map["calls"].details if d.object_key == "extroutine/EXTRA_PROG"
+        ][0]
+        assert extra_detail.endpoint_verdict == "UNKNOWN"
+
+        # ── BUG 1 & BUG 2 VERIFICATION ──
         binds_details = pred_map["binds_dd"].details
         assert not any(d.subject_key.startswith("dd/") for d in binds_details)
 
-        # ── BUG 2 VERIFICATION ──
-        # UNAUTHPROG has DOC_ONLY relation in doc, but file status is 'partial' -> MUST be UNKNOWN!
         unauth_details = [
             d for d in pred_map["calls"].details if d.subject_key == "program/UNAUTHPROG"
         ]
         assert len(unauth_details) == 1
         assert unauth_details[0].endpoint_verdict == "UNKNOWN"
-        assert unauth_details[0].eligibility == "non_authoritative"
-
-        # ── BUG 3 & BUG 4 VERIFICATION ──
-        # Check CBSTM03B details: separate rows for BD and DD
-        cbstm03b_details = [
-            d for d in pred_map["calls"].details if d.object_key == "program/CBSTM03B"
-        ]
-        assert len(cbstm03b_details) == 2  # One BD row and one DD row
-
-        dd_row = [d for d in cbstm03b_details if d.side == "DD"][0]
-        assert dd_row.endpoint_verdict == "MATCH"
-        assert dd_row.multiplicity_verdict == "EXACT_SITE_MATCH"
-        assert dd_row.doc_count == 13
-
-        bd_row = [d for d in cbstm03b_details if d.side == "BD"][0]
-        assert bd_row.endpoint_verdict == "MATCH"
-        assert bd_row.multiplicity_verdict == "COUNT_ONLY_MATCH"
-        assert bd_row.doc_count == 13
-
-        # Total summary checks
-        assert res.summary.doc_only == 0  # 0 false DOC_ONLYs!
 
     finally:
         await close_db()

@@ -120,6 +120,10 @@ const api = {
       }
     }
   },
+  docCode: {
+    compare: invoke('docCode:compare'),
+    compareRelations: invoke('docCode:compareRelations')
+  },
   query: {
     exportCsv: invoke('query:exportCsv')
   },
