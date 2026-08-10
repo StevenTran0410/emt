@@ -32,12 +32,15 @@ def build_program_index(cobol_files: dict[str, str | None]) -> dict[str, list[st
     return prog_map
 
 
+SYSTEM_COPYBOOK_PREFIXES = ("CMQ", "DFH", "IGZ", "CEE", "DSN", "ELX")
+
+
 def build_copybook_index(file_set: set[str]) -> dict[str, list[str]]:
     """Build map from uppercase copybook stem to list of rel_paths."""
     copy_map: dict[str, list[str]] = {}
     for rel_path in file_set:
         lower = rel_path.lower()
-        if lower.endswith(".cpy"):
+        if lower.endswith(".cpy") or lower.endswith(".dcl"):
             stem = rel_path.rsplit("/", 1)[-1].rsplit(".", 1)[0].upper()
             copy_map.setdefault(stem, []).append(rel_path)
     return copy_map
@@ -141,17 +144,18 @@ def resolve_cobol_copies(
     copies: list[dict],  # list of {"member": ..., "line": ..., "resolution_method": ...}
     copybook_index: dict[str, list[str]],
 ) -> list[ResolvedCobolEdge]:
-    """Resolve COPY statements into edges."""
+    """Resolve COPY and EXEC SQL INCLUDE statements into edges."""
     src_symbol = f"{src_file}::{src_program_id}" if src_program_id else f"{src_file}::MEMBER"
 
-    copy_groups: dict[str, list[int]] = {}
+    copy_groups: dict[tuple[str, str], list[int]] = {}
     for c in copies:
         member = c["member"].upper()
-        copy_groups.setdefault(member, []).append(c["line"])
+        res_m = c.get("resolution_method", "cobol_copy_statement")
+        copy_groups.setdefault((member, res_m), []).append(c["line"])
 
     edges: list[ResolvedCobolEdge] = []
 
-    for member, lines in copy_groups.items():
+    for (member, orig_res_m), lines in copy_groups.items():
         matches = copybook_index.get(member, [])
         if len(matches) == 1:
             dst_file = matches[0]
@@ -165,7 +169,7 @@ def resolve_cobol_copies(
                     edge_type="copies",
                     is_external=False,
                     confidence_score=1.0,
-                    resolution_method="cobol_copy_statement",
+                    resolution_method=orig_res_m,
                     evidence_lines=sorted(lines),
                 )
             )
@@ -185,7 +189,12 @@ def resolve_cobol_copies(
                 )
             )
         else:
-            dst_file = f"__unresolved__/copybook/{member}"
+            if member.startswith(SYSTEM_COPYBOOK_PREFIXES):
+                dst_file = f"__external__/copybook/{member}"
+                res_method = "system_copybook"
+            else:
+                dst_file = f"__unresolved__/copybook/{member}"
+                res_method = "copybook_not_found"
             edges.append(
                 ResolvedCobolEdge(
                     src_file=src_file,
@@ -195,7 +204,7 @@ def resolve_cobol_copies(
                     edge_type="copies",
                     is_external=True,
                     confidence_score=0.0,
-                    resolution_method="copybook_not_found",
+                    resolution_method=res_method,
                     evidence_lines=sorted(lines),
                 )
             )

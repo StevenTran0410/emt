@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import logging
 
-from ..symbol_graph import SymbolEdge
 from .._symbol_parser import ParsedFile, SymbolInfo
+from ..symbol_graph import SymbolEdge
 from .call_resolution import resolve_call_site
 from .helpers import _resolve_type_name
 from .indexes import build_constructor_index, build_definition_index, build_inheritance_index

@@ -9,7 +9,6 @@ import ast
 
 from ._models import AttributeAssign, CallSite, ImportInfo, ParsedFile, SymbolInfo
 
-
 # ---------------------------------------------------------------------------
 # Python parser (ast module)
 # ---------------------------------------------------------------------------

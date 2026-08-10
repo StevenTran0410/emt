@@ -5,6 +5,7 @@ import re
 from typing import Any, NamedTuple
 
 from antlr4.error.ErrorListener import ErrorListener
+
 from .generated.JCLParserListener import JCLParserListener
 
 
@@ -14,6 +15,7 @@ class JclExecFact(NamedTuple):
     program_name: str
     line: int
     evidence_lines: list[int]
+    is_proc: bool = False
 
 
 class JclDdFact(NamedTuple):
@@ -32,7 +34,7 @@ class JclExtractionResult(NamedTuple):
 
 
 def extract_jcl_facts(content: str) -> JclExtractionResult:
-    """Extract EXEC PGM= and DD ... DSN= facts from JCL source content."""
+    """Extract EXEC PGM=, EXEC PROC=, and DD ... DSN= facts from JCL source content."""
     if not content or not content.strip():
         return JclExtractionResult(job_name=None, execs=[], dds=[])
 
@@ -92,26 +94,45 @@ def extract_jcl_facts(content: str) -> JclExtractionResult:
             job_name = job_match.group(1).upper()
             continue
 
-        # Check EXEC PGM=
-        exec_match = re.match(
-            r"^//([A-Za-z0-9#$@]+)?\s+EXEC\s+.*?\bPGM=([A-Za-z0-9#$@&]+)",
-            text,
-            re.IGNORECASE,
-        )
+        # Check EXEC statement
+        exec_match = re.match(r"^//([A-Za-z0-9#$@]+)?\s+EXEC\s+(.*)", text, re.IGNORECASE)
         if exec_match:
             step_name = exec_match.group(1).upper() if exec_match.group(1) else "STEP"
-            pgm_name = exec_match.group(2).upper()
-            current_step = step_name
-            execs.append(
-                JclExecFact(
-                    job_name=job_name,
-                    step_name=step_name,
-                    program_name=pgm_name,
-                    line=lnums[0],
-                    evidence_lines=lnums,
+            rest = exec_match.group(2).strip()
+            first_token = re.split(r"[\s,]", rest)[0].strip()
+
+            if first_token.upper().startswith("PGM="):
+                pgm_name = first_token[4:].upper()
+                current_step = step_name
+                execs.append(
+                    JclExecFact(
+                        job_name=job_name,
+                        step_name=step_name,
+                        program_name=pgm_name,
+                        line=lnums[0],
+                        evidence_lines=lnums,
+                        is_proc=False,
+                    )
                 )
-            )
-            continue
+                continue
+            elif first_token:
+                proc_name = (
+                    first_token[5:].upper()
+                    if first_token.upper().startswith("PROC=")
+                    else first_token.upper()
+                )
+                current_step = step_name
+                execs.append(
+                    JclExecFact(
+                        job_name=job_name,
+                        step_name=step_name,
+                        program_name=proc_name,
+                        line=lnums[0],
+                        evidence_lines=lnums,
+                        is_proc=True,
+                    )
+                )
+                continue
 
         # Check DD DSN=
         dd_match = re.match(r"^//([A-Za-z0-9#$@]+)\s+DD\b", text, re.IGNORECASE)
@@ -283,8 +304,10 @@ def extract_jcl_enrichment_facts(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Extract full JCL facts and diagnostic record using ANTLR parser."""
     import time
+
     from antlr4 import CommonTokenStream, InputStream, ParseTreeWalker
     from antlr4.atn.PredictionMode import PredictionMode
+
     from .generated.JCLLexer import JCLLexer
     from .generated.JCLParser import JCLParser
 

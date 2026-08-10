@@ -101,6 +101,20 @@ class _BuildMixin:
 
         return source_dir, bd_file, ordered_files, file_tuples, input_fingerprint, cluster_name
 
+    async def _validate_snapshot_binding(self, db: Any, snapshot_id: str | None) -> None:
+        if not snapshot_id or not snapshot_id.strip():
+            raise ValueError(
+                "snapshot_id is required: doc graph must be bound to a repository snapshot"
+            )
+        async with db.execute(
+            "SELECT 1 FROM repo_snapshots WHERE id=?", (snapshot_id.strip(),)
+        ) as cur:
+            row = await cur.fetchone()
+            if not row:
+                raise ValueError(
+                    f"Invalid snapshot_id: '{snapshot_id}' does not exist in repo_snapshots"
+                )
+
     async def build(self, req: BuildDocGraphRequest) -> DocGraphSummary:
         """Build doc graph cluster (non-streaming, synchronous result)."""
         (
@@ -115,6 +129,8 @@ class _BuildMixin:
         cluster_id = _hash_string(f"{source_dir}:{cluster_name}")
         now = utc_now_iso()
         db = get_db()
+
+        await self._validate_snapshot_binding(db, req.snapshot_id)
 
         if not req.force_rebuild:
             async with db.execute(
@@ -341,6 +357,8 @@ class _BuildMixin:
             cluster_id = _hash_string(f"{source_dir}:{cluster_name}")
             now = utc_now_iso()
             db = get_db()
+
+            await self._validate_snapshot_binding(db, req.snapshot_id)
 
             if not req.force_rebuild:
                 async with db.execute(

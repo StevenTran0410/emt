@@ -1,6 +1,14 @@
 export type ExportJson = {
   nodes: string[]
-  edges: Array<{ src: string; dst: string; external: boolean }>
+  edges: Array<{
+    src: string
+    dst: string
+    external: boolean
+    edge_type?: string
+    confidence_score?: number
+    resolution_method?: string
+    resolution_class?: string
+  }>
   communities: Record<string, number>       // node_path -> community_id
   community_groups: Record<string, string[]> // community_id -> [node_paths]
   cycles: string[][]
@@ -34,6 +42,7 @@ export type NeighborResult = {
     dst_path: string
     edge_type: string
     is_external: boolean
+    resolution_class?: string
   }>
 }
 

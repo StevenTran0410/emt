@@ -136,8 +136,30 @@ def _run_main_grammar_pass(
     return listener_m.program_id, listener_m.calls
 
 
+def _extract_exec_sql_includes(norm: str) -> list[CobolCopyFact]:
+    """Scan multiline EXEC SQL ... END-EXEC blocks for INCLUDE <member>."""
+    results: list[CobolCopyFact] = []
+    sql_blocks = re.finditer(
+        r"EXEC\s+SQL\s+(.*?)\s+END-EXEC", norm, re.IGNORECASE | re.DOTALL
+    )
+    for m in sql_blocks:
+        body = m.group(1).strip()
+        inc_match = re.search(r"^\s*INCLUDE\s+['\"]?([A-Za-z0-9_-]+)['\"]?", body, re.IGNORECASE)
+        if inc_match:
+            member = inc_match.group(1).upper()
+            line_no = norm[:m.start()].count("\n") + 1
+            results.append(
+                CobolCopyFact(
+                    member=member,
+                    line=line_no,
+                    resolution_method="exec_sql_include",
+                )
+            )
+    return results
+
+
 def extract_cobol_facts(content: str) -> CobolExtractionResult:
-    """Extract PROGRAM-ID, CALL, and COPY statements from COBOL source code using ANTLR parsers."""
+    """Extract PROGRAM-ID, CALL, and COPY/SQL-INCLUDE statements from COBOL source code using ANTLR parsers + SQL include scanner."""
     if not content or not content.strip():
         return CobolExtractionResult(program_id=None, calls=[], copies=[])
 
@@ -160,8 +182,6 @@ def extract_cobol_facts(content: str) -> CobolExtractionResult:
         parser_p = Cobol85PreprocessorParser(tokens_p)
         parser_p.removeErrorListeners()
         parser_p.addErrorListener(silent_listener)
-        # SLL prediction here too — the preprocessor grammar hits the same ALL(*) blowup
-        # (COACTUPC ~3.9s → 0.6s), and SLL yields identical COPY facts across the corpus.
         parser_p._interp.predictionMode = PredictionMode.SLL
 
         tree_p = parser_p.startRule()
@@ -174,6 +194,12 @@ def extract_cobol_facts(content: str) -> CobolExtractionResult:
     except Exception:
         pass
 
+    # Always extract multiline EXEC SQL INCLUDE facts and merge with copies
+    sql_includes = _extract_exec_sql_includes(norm)
+    for inc in sql_includes:
+        if not any(c.member == inc.member and c.line == inc.line for c in copies):
+            copies.append(inc)
+
     # Replace COPY statement spans with spaces to preserve line numbers for main pass
     norm_list = list(norm)
     for start, stop in copy_spans:
@@ -182,9 +208,7 @@ def extract_cobol_facts(content: str) -> CobolExtractionResult:
                 norm_list[i] = " "
     norm_no_copy = "".join(norm_list)
 
-    # 2. ANTLR Main Pass for PROGRAM-ID and CALL statements. Runs inline: SLL prediction
-    # (see _run_main_grammar_pass) keeps every parse bounded and fast, so there is no
-    # pathological case to guard against with a thread/process timeout.
+    # 2. ANTLR Main Pass for PROGRAM-ID and CALL statements.
     upper_norm = norm_no_copy.upper()
     if "IDENTIFICATION" in upper_norm or "PROGRAM-ID" in upper_norm or "CALL" in upper_norm:
         try:
@@ -194,30 +218,19 @@ def extract_cobol_facts(content: str) -> CobolExtractionResult:
                 calls = m_calls
                 antlr_success = True
         except Exception:
-            # Parse crash — let the regex fallback below recover.
             logger.debug(
                 "[cobol] main-grammar parse failed; using regex fallback", exc_info=True
             )
 
-    # Regex is a supplement, not a failure signal. The full grammar legitimately
-    # extracts nothing for a keyword that only appears in a comment or data name, and a
-    # copybook has no executable CALLs at all — so a bare "CALL"/"COPY" substring is not
-    # evidence of incomplete parsing. Run regex only where a fact is plausibly missing,
-    # gate CALL recovery on real program context (copybooks stay call-free, killing the
-    # false positives the raw CALL regex would otherwise inject), and only log when it
-    # actually recovers something, so the log means "regex found what ANTLR missed"
-    # rather than firing on every healthy CICS program.
     want_pid = program_id is None and "PROGRAM-ID" in upper_norm
     want_calls = not calls and "CALL" in upper_norm
-    want_copies = not copies and "COPY" in upper_norm
+    want_copies = not copies and ("COPY" in upper_norm or "INCLUDE" in upper_norm)
     if not antlr_success or want_pid or want_calls or want_copies:
         fb = _extract_cobol_facts_regex_fallback(norm)
         recovered: list[str] = []
         if program_id is None and fb.program_id:
             program_id = fb.program_id
             recovered.append("program-id")
-        # program_id is now set iff this is a real program (ANTLR or regex found one);
-        # copybooks stay None, so their spurious CALL matches are dropped here.
         if not calls and program_id is not None and fb.calls:
             calls = fb.calls
             recovered.append(f"{len(fb.calls)} call(s)")
@@ -770,6 +783,14 @@ def extract_cobol_all(
     except Exception:
         pass
 
+    # The preprocessor COPY pass does not recognise EXEC SQL INCLUDE, so scan for it
+    # separately and merge unconditionally (mirrors extract_cobol_facts). Gating this
+    # behind the empty-copies fallback would drop SQL includes from any program that
+    # also has ordinary COPY statements.
+    for inc in _extract_exec_sql_includes(norm):
+        if not any(c.member == inc.member and c.line == inc.line for c in copies):
+            copies.append(inc)
+
     # Replace COPY statement spans with spaces to preserve line numbers
     norm_list = list(norm)
     for start, stop in copy_spans:
@@ -866,10 +887,11 @@ def _extract_cobol_facts_regex_fallback(norm: str) -> CobolExtractionResult:
         if not line:
             continue
 
-        copy_match = re.search(r"\bCOPY\s+['\"]?([A-Za-z0-9_-]+)['\"]?", line, re.IGNORECASE)
+        copy_match = re.search(r"\b(?:COPY|EXEC\s+SQL\s+INCLUDE)\s+['\"]?([A-Za-z0-9_-]+)['\"]?", line, re.IGNORECASE)
         if copy_match:
             copybook = copy_match.group(1).upper()
-            copies.append(CobolCopyFact(member=copybook, line=idx, resolution_method="cobol_copy_statement"))
+            method = "exec_sql_include" if "INCLUDE" in copy_match.group(0).upper() else "cobol_copy_statement"
+            copies.append(CobolCopyFact(member=copybook, line=idx, resolution_method=method))
             continue
 
         if re.search(r"\bCALL\b", line, re.IGNORECASE):

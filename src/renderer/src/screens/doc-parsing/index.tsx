@@ -12,24 +12,16 @@ import {
   Sparkles,
   Plus,
   ArrowLeft,
+  ArrowRight,
   History,
   Eye,
   Filter,
-  Trash2
+  Trash2,
+  FolderOpen,
+  Maximize2,
+  Link
 } from 'lucide-react'
-import {
-  ReactFlow,
-  Background,
-  Controls,
-  type Node,
-  type Edge,
-  type NodeProps,
-  Handle,
-  Position
-} from '@xyflow/react'
-import '@xyflow/react/dist/style.css'
-
-import { applyDagreLayout } from '../graph/layout'
+import { DocGraphModal } from './DocGraphModal'
 import { Button, Spinner, ErrorBanner } from '../../components/ui'
 import type {
   DocGraphSummary,
@@ -37,7 +29,8 @@ import type {
   DocNode,
   DocEdge,
   DocMismatch,
-  DocGraphClusterSummary
+  DocGraphClusterSummary,
+  LocalRepo
 } from '../../types/electron'
 
 function basename(pathStr: string): string {
@@ -89,6 +82,13 @@ function getNodeStyle(nodeType: string): { bg: string; border: string; text: str
         text: 'text-rose-200',
         dot: 'bg-rose-400'
       }
+    case 'dd':
+      return {
+        bg: 'bg-blue-950/90',
+        border: 'border-blue-500/80',
+        text: 'text-blue-200',
+        dot: 'bg-blue-400'
+      }
     case 'br':
       return {
         bg: 'bg-teal-950/90',
@@ -96,13 +96,19 @@ function getNodeStyle(nodeType: string): { bg: string; border: string; text: str
         text: 'text-teal-200',
         dot: 'bg-teal-400'
       }
-    case 'tbd':
     case 'ddlimit':
       return {
         bg: 'bg-orange-950/90',
         border: 'border-orange-500/80',
         text: 'text-orange-200',
         dot: 'bg-orange-400'
+      }
+    case 'tbd':
+      return {
+        bg: 'bg-yellow-950/90',
+        border: 'border-yellow-500/80',
+        text: 'text-yellow-200',
+        dot: 'bg-yellow-400'
       }
     case 'capability':
       return {
@@ -111,6 +117,13 @@ function getNodeStyle(nodeType: string): { bg: string; border: string; text: str
         text: 'text-fuchsia-200',
         dot: 'bg-fuchsia-400'
       }
+    case 'doc':
+      return {
+        bg: 'bg-cyan-950/90',
+        border: 'border-cyan-500/80',
+        text: 'text-cyan-200',
+        dot: 'bg-cyan-400'
+      }
     case 'actor':
       return {
         bg: 'bg-slate-800/90',
@@ -118,8 +131,6 @@ function getNodeStyle(nodeType: string): { bg: string; border: string; text: str
         text: 'text-slate-200',
         dot: 'bg-slate-400'
       }
-    case 'dd':
-    case 'doc':
     default:
       return {
         bg: 'bg-zinc-800/90',
@@ -130,34 +141,11 @@ function getNodeStyle(nodeType: string): { bg: string; border: string; text: str
   }
 }
 
-function CustomDocNodeComponent({ data }: NodeProps): React.ReactElement {
-  const label = String(data.label || '')
-  const type = String(data.nodeType || 'node')
-  const style = getNodeStyle(type)
-
-  return (
-    <div
-      className={`px-3 py-1.5 rounded-lg border shadow-md flex items-center gap-2 cursor-pointer transition-all hover:scale-105 ${style.bg} ${style.border} ${style.text}`}
-      style={{ minWidth: '140px' }}
-    >
-      <Handle type="target" position={Position.Left} className="w-2 h-2 !bg-zinc-400" />
-      <span className={`w-2 h-2 rounded-full shrink-0 ${style.dot}`} />
-      <div className="flex flex-col min-w-0 flex-1">
-        <span className="text-xs font-semibold truncate leading-tight">{label}</span>
-        <span className="text-[10px] opacity-75 font-mono uppercase truncate">{type}</span>
-      </div>
-      <Handle type="source" position={Position.Right} className="w-2 h-2 !bg-zinc-400" />
-    </div>
-  )
-}
-
-const nodeTypesConfig = {
-  customDocNode: CustomDocNodeComponent
-}
-
 export default function DocParsingScreen(): React.ReactElement {
   const [ddPaths, setDdPaths] = useState<string[]>([])
   const [bdPaths, setBdPaths] = useState<string[]>([])
+  const [repos, setRepos] = useState<LocalRepo[]>([])
+  const [selectedSnapshotId, setSelectedSnapshotId] = useState<string>('')
   const [llmEnabled, setLlmEnabled] = useState<boolean>(true)
   const [parsing, setParsing] = useState<boolean>(false)
   const [llmProgress, setLlmProgress] = useState<{ done: number; total: number } | null>(null)
@@ -166,7 +154,8 @@ export default function DocParsingScreen(): React.ReactElement {
   const [summary, setSummary] = useState<DocGraphSummary | null>(null)
   const [exportData, setExportData] = useState<DocGraphExport | null>(null)
 
-  const [showAllNodes, setShowAllNodes] = useState<boolean>(true)
+  const [showAllNodes, setShowAllNodes] = useState<boolean>(false)
+  const [isFullGraphOpen, setIsFullGraphOpen] = useState<boolean>(false)
   const [selectedNode, setSelectedNode] = useState<DocNode | null>(null)
   const [activeMismatchTab, setActiveMismatchTab] = useState<'deterministic' | 'llm'>(
     'deterministic'
@@ -192,6 +181,16 @@ export default function DocParsingScreen(): React.ReactElement {
 
   useEffect(() => {
     loadRecentClusters()
+    window.api.folder
+      .list()
+      .then((list) => {
+        setRepos(list || [])
+        const indexed = (list || []).filter((r) => Boolean(r.active_snapshot_id))
+        if (indexed.length > 0 && indexed[0].active_snapshot_id) {
+          setSelectedSnapshotId(indexed[0].active_snapshot_id)
+        }
+      })
+      .catch(() => {})
   }, [loadRecentClusters])
 
   const cleanupStreamListener = useCallback(() => {
@@ -230,7 +229,8 @@ export default function DocParsingScreen(): React.ReactElement {
     }
   }
 
-  const canStartParsing = ddPaths.length >= 1 && bdPaths.length === 1 && !parsing
+  const canStartParsing =
+    ddPaths.length >= 1 && bdPaths.length === 1 && Boolean(selectedSnapshotId) && !parsing
 
   const handleStartParsing = async () => {
     if (!canStartParsing) return
@@ -292,6 +292,7 @@ export default function DocParsingScreen(): React.ReactElement {
       const allFiles = [...ddPaths, ...bdPaths]
       await window.api.docGraph.buildStream({
         files: allFiles,
+        snapshot_id: selectedSnapshotId,
         force_rebuild: true,
         llm_enabled: llmEnabled
       })
@@ -344,7 +345,7 @@ export default function DocParsingScreen(): React.ReactElement {
   }
 
   // Compute connected vs isolated nodes
-  const { connectedNodeIds, isolatedNodesGrouped, totalIsolatedCount } = useMemo(() => {
+  const { isolatedNodesGrouped, totalIsolatedCount } = useMemo(() => {
     if (!exportData || !exportData.nodes) {
       return { connectedNodeIds: new Set<string>(), isolatedNodesGrouped: {}, totalIsolatedCount: 0 }
     }
@@ -374,48 +375,41 @@ export default function DocParsingScreen(): React.ReactElement {
     }
   }, [exportData])
 
-  // Build flow graph nodes & edges
-  const flowNodesAndEdges = useMemo(() => {
-    if (!exportData || !exportData.nodes) return { nodes: [], edges: [], presentNodeTypes: [] }
+  // Compute 1-hop connection details for the selected node (isolated-node inspection)
+  const { connectedEdgeList } = useMemo(() => {
+    if (!selectedNode || !exportData?.edges) {
+      return { connectedEdgeList: [] }
+    }
 
-    const filteredNodes = showAllNodes
-      ? exportData.nodes
-      : exportData.nodes.filter((n) => connectedNodeIds.has(n.id) && n.node_type !== 'field')
+    const connEdges: Array<{
+      edge: DocEdge
+      otherNode: DocNode | null
+      direction: 'outgoing' | 'incoming'
+    }> = []
 
-    const rawNodes = filteredNodes.slice(0, 400)
-    const validNodeIds = new Set(rawNodes.map((n) => n.id))
+    const nodeMap = new Map<string, DocNode>()
+    for (const n of exportData.nodes || []) {
+      nodeMap.set(n.id, n)
+    }
 
-    const initialNodes: Node[] = rawNodes.map((n) => ({
-      id: n.id,
-      type: 'customDocNode',
-      data: { label: n.display_name, nodeType: n.node_type, rawNode: n },
-      position: { x: 0, y: 0 }
-    }))
+    for (const e of exportData.edges) {
+      if (e.src_node_id === selectedNode.id) {
+        connEdges.push({
+          edge: e,
+          otherNode: nodeMap.get(e.dst_node_id) || null,
+          direction: 'outgoing'
+        })
+      } else if (e.dst_node_id === selectedNode.id) {
+        connEdges.push({
+          edge: e,
+          otherNode: nodeMap.get(e.src_node_id) || null,
+          direction: 'incoming'
+        })
+      }
+    }
 
-    const initialEdges: Edge[] = exportData.edges
-      .filter((e) => validNodeIds.has(e.src_node_id) && validNodeIds.has(e.dst_node_id))
-      .map((e) => ({
-        id: `${e.src_node_id}->${e.dst_node_id}:${e.edge_type}`,
-        source: e.src_node_id,
-        target: e.dst_node_id,
-        label: e.edge_type,
-        style: { stroke: '#64748b', strokeWidth: 1.5 },
-        animated: false
-      }))
-
-    const layoutedNodes = applyDagreLayout(initialNodes, initialEdges)
-    const presentNodeTypes = Array.from(new Set(rawNodes.map((n) => n.node_type))).sort()
-
-    return { nodes: layoutedNodes, edges: initialEdges, presentNodeTypes }
-  }, [exportData, showAllNodes, connectedNodeIds])
-
-  const handleNodeClick = useCallback(
-    (_: React.MouseEvent, node: Node) => {
-      const rawNode = (node.data?.rawNode as DocNode) || null
-      setSelectedNode(rawNode)
-    },
-    []
-  )
+    return { connectedEdgeList: connEdges }
+  }, [selectedNode, exportData])
 
   const deterministicMismatches = useMemo(() => {
     if (!exportData?.mismatches) return []
@@ -462,10 +456,15 @@ export default function DocParsingScreen(): React.ReactElement {
               <FileText className="w-5 h-5 text-indigo-400" />
               Document Graph Results: {summary.cluster_name}
             </h1>
-            <p className="text-xs text-zinc-400 mt-1">
-              Parsed {summary.document_count} files into {summary.node_count} nodes &{' '}
-              {summary.edge_count} edges with {exportData.mismatches.length} mismatches.
-            </p>
+            <div className="flex items-center gap-3 text-xs text-zinc-400 mt-1">
+              <span>
+                Parsed {summary.document_count} files into {summary.node_count} nodes &{' '}
+                {summary.edge_count} edges with {exportData.mismatches.length} mismatches.
+              </span>
+              <span className="px-2.5 py-0.5 rounded-full bg-indigo-950/80 text-indigo-300 font-mono text-[11px] border border-indigo-800">
+                Bound to: {selectedSnapshotId ? selectedSnapshotId.substring(0, 12) + '...' : 'unbound'}
+              </span>
+            </div>
           </div>
           <Button variant="secondary" size="sm" onClick={handleReset} className="gap-2">
             <ArrowLeft className="w-4 h-4" />
@@ -558,64 +557,51 @@ export default function DocParsingScreen(): React.ReactElement {
         {/* (b) Doc-Graph Visualization */}
         <div className="bg-zinc-800/40 border border-zinc-700/80 rounded-xl overflow-hidden relative flex flex-col space-y-0">
           <div className="px-4 py-3 border-b border-zinc-700/80 flex items-center justify-between bg-zinc-900/60">
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-2">
-                <Layers className="w-4 h-4 text-indigo-400" />
-                <span className="font-semibold text-sm text-zinc-200">
-                  Document Graph Visualization
-                </span>
-              </div>
-
-              {/* Show All Nodes Toggle */}
-              <button
-                onClick={() => setShowAllNodes((v) => !v)}
-                className={`px-2.5 py-1 rounded text-xs font-medium border flex items-center gap-1.5 transition-colors ${
-                  showAllNodes
-                    ? 'bg-indigo-900/60 text-indigo-200 border-indigo-500/50'
-                    : 'bg-zinc-800 text-zinc-400 border-zinc-700 hover:text-zinc-200'
-                }`}
-                title="Toggle between connected structural nodes vs all nodes including floating annotations"
-              >
-                <Filter className="w-3 h-3" />
-                <span>Show all nodes</span>
-                {totalIsolatedCount > 0 && (
-                  <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-zinc-900 text-zinc-300 font-mono">
-                    +{totalIsolatedCount} isolated
-                  </span>
-                )}
-              </button>
+            <div className="flex items-center gap-2">
+              <Layers className="w-4 h-4 text-indigo-400" />
+              <span className="font-semibold text-sm text-zinc-200">
+                Document Graph Visualization
+              </span>
             </div>
 
-            {/* Legend */}
-            <div className="flex items-center gap-3 text-xs flex-wrap">
-              {flowNodesAndEdges.presentNodeTypes.map((type) => {
-                const st = getNodeStyle(type)
-                return (
-                  <div key={type} className="flex items-center gap-1.5">
-                    <span className={`w-2.5 h-2.5 rounded-full ${st.dot}`} />
-                    <span className="text-zinc-300 font-mono text-[11px] uppercase">{type}</span>
-                  </div>
-                )
-              })}
-            </div>
+            {/* Open Graph Full-Page Button — graph renders only in the full-screen view */}
+            <button
+              onClick={() => setIsFullGraphOpen(true)}
+              className="px-2.5 py-1 rounded text-xs font-medium bg-indigo-600 hover:bg-indigo-500 text-white flex items-center gap-1.5 transition-colors shadow-sm"
+              title="Open full-screen graph view"
+            >
+              <Maximize2 className="w-3.5 h-3.5" />
+              <span>Open graph</span>
+            </button>
           </div>
 
           <div className="h-[480px] w-full relative">
-            <ReactFlow
-              nodes={flowNodesAndEdges.nodes}
-              edges={flowNodesAndEdges.edges}
-              nodeTypes={nodeTypesConfig}
-              onNodeClick={handleNodeClick}
-              fitView
-              colorMode="dark"
-            >
-              <Background color="#334155" gap={16} />
-              <Controls />
-            </ReactFlow>
+            <div className="h-full w-full flex items-center justify-center">
+              <div className="text-center space-y-4 px-6">
+                <div className="w-14 h-14 rounded-2xl bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center mx-auto">
+                  <Maximize2 className="w-6 h-6 text-indigo-400" />
+                </div>
+                <div className="space-y-1">
+                  <p className="text-sm font-semibold text-zinc-200">
+                    Graph ready — {summary.node_count} nodes · {summary.edge_count} edges
+                  </p>
+                  <p className="text-xs text-zinc-500">
+                    Click &ldquo;Open graph&rdquo; to explore the full-screen view.
+                  </p>
+                </div>
+                <Button
+                  onClick={() => setIsFullGraphOpen(true)}
+                  className="bg-indigo-600 hover:bg-indigo-500 text-white gap-2 mx-auto"
+                >
+                  <Maximize2 className="w-4 h-4" />
+                  Open graph
+                </Button>
+              </div>
+            </div>
 
             {/* Selected Node Panel */}
             {selectedNode && (
-              <div className="absolute bottom-4 right-4 w-80 bg-zinc-900/95 border border-zinc-700 rounded-xl p-4 shadow-xl backdrop-blur text-xs space-y-3 z-10">
+              <div className="absolute bottom-4 right-4 w-80 bg-zinc-900/95 border border-zinc-700 rounded-xl p-4 shadow-xl backdrop-blur text-xs space-y-3 z-10 max-h-[420px] overflow-y-auto">
                 <div className="flex items-center justify-between border-b border-zinc-800 pb-2">
                   <div className="flex items-center gap-2 truncate">
                     <span
@@ -662,9 +648,69 @@ export default function DocParsingScreen(): React.ReactElement {
                     </div>
                   </div>
                 )}
+
+                {/* Connections List */}
+                <div className="space-y-2 pt-2 border-t border-zinc-800">
+                  <span className="text-zinc-300 font-semibold flex items-center gap-1.5">
+                    <Link className="w-3.5 h-3.5 text-amber-400" />
+                    Connections ({connectedEdgeList.length})
+                  </span>
+
+                  {connectedEdgeList.length === 0 ? (
+                    <div className="p-2 bg-zinc-950/50 rounded text-zinc-500 italic text-[11px]">
+                      No direct connections found.
+                    </div>
+                  ) : (
+                    <div className="space-y-1 max-h-36 overflow-y-auto pr-1">
+                      {connectedEdgeList.map(({ edge, otherNode, direction }, idx) => {
+                        const otherType = otherNode?.node_type || 'other'
+                        const st = getNodeStyle(otherType)
+                        return (
+                          <button
+                            key={idx}
+                            onClick={() => otherNode && setSelectedNode(otherNode)}
+                            className="w-full text-left bg-zinc-950/80 hover:bg-zinc-800 p-1.5 rounded border border-zinc-800 transition-colors flex items-center justify-between group text-[11px]"
+                          >
+                            <div className="space-y-0.5 min-w-0 flex-1 pr-1">
+                              <div className="flex items-center gap-1">
+                                <span className="px-1 py-0.2 rounded text-[9px] bg-zinc-800 text-amber-300 font-mono uppercase font-bold border border-amber-500/30">
+                                  {edge.edge_type}
+                                </span>
+                                <span className="text-[10px] text-zinc-400 flex items-center gap-0.5">
+                                  {direction === 'outgoing' ? (
+                                    <ArrowRight className="w-3 h-3 text-emerald-400" />
+                                  ) : (
+                                    <ArrowLeft className="w-3 h-3 text-sky-400" />
+                                  )}
+                                </span>
+                              </div>
+                              <div className="font-mono text-zinc-200 text-[11px] truncate group-hover:text-amber-300">
+                                {otherNode?.display_name || (direction === 'outgoing' ? edge.dst_node_id : edge.src_node_id)}
+                              </div>
+                            </div>
+                            <span className={`px-1 py-0.2 rounded text-[9px] font-mono uppercase shrink-0 ${st.bg} ${st.text}`}>
+                              {otherType}
+                            </span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
           </div>
+
+          {/* Full-Page Doc Graph Modal Overlay */}
+          {isFullGraphOpen && exportData && (
+            <DocGraphModal
+              exportData={exportData}
+              summary={summary}
+              showAllNodes={showAllNodes}
+              setShowAllNodes={setShowAllNodes}
+              onClose={() => setIsFullGraphOpen(false)}
+            />
+          )}
 
           {/* Compact Isolated Annotation Nodes Panel */}
           {totalIsolatedCount > 0 && !showAllNodes && (
@@ -802,55 +848,18 @@ export default function DocParsingScreen(): React.ReactElement {
                             >
                               {m.severity}
                             </span>
-                            <span className="font-mono font-semibold text-zinc-200">
+                            <span className="font-mono text-zinc-300 font-semibold uppercase">
                               {m.mismatch_type}
                             </span>
                           </div>
-                          <p className="text-zinc-300 font-medium leading-relaxed">
-                            {m.description}
-                          </p>
+                          <p className="text-zinc-200">{m.description}</p>
                         </div>
                       </div>
-
-                      {m.confidence && (
-                        <span className="text-[10px] text-zinc-500 bg-zinc-950 px-2 py-0.5 rounded font-mono border border-zinc-800 shrink-0">
-                          conf: {m.confidence}
-                        </span>
-                      )}
                     </div>
 
+                    {/* Expanded details */}
                     {isExpanded && (
-                      <div className="mt-3 pt-3 border-t border-zinc-800/80 space-y-2.5 text-zinc-400 pl-6">
-                        {/* Locations */}
-                        <div className="grid grid-cols-2 gap-3 bg-zinc-950 p-2.5 rounded border border-zinc-800/80">
-                          <div>
-                            <span className="text-zinc-500 font-semibold block mb-0.5">
-                              BD Location:
-                            </span>
-                            {m.bd_location ? (
-                              <span className="font-mono text-zinc-300">
-                                {m.bd_location.doc} ({m.bd_location.section || 'section'} L
-                                {m.bd_location.line})
-                              </span>
-                            ) : (
-                              <span className="text-zinc-600">N/A</span>
-                            )}
-                          </div>
-                          <div>
-                            <span className="text-zinc-500 font-semibold block mb-0.5">
-                              DD Location:
-                            </span>
-                            {m.dd_location ? (
-                              <span className="font-mono text-zinc-300">
-                                {m.dd_location.doc} ({m.dd_location.section || 'section'} L
-                                {m.dd_location.line})
-                              </span>
-                            ) : (
-                              <span className="text-zinc-600">N/A</span>
-                            )}
-                          </div>
-                        </div>
-
+                      <div className="pl-6 pt-2 border-t border-zinc-800/80 space-y-2">
                         {/* Evidence Quotes for LLM tier */}
                         {m.derivation === 'llm' && (
                           <div className="space-y-2">
@@ -900,11 +909,41 @@ export default function DocParsingScreen(): React.ReactElement {
           Document Parsing
         </h1>
         <p className="screen-subtitle">
-          Upload DD + BD reports, parse into a graph, and check BD↔DD consistency.
+          Upload DD + BD reports, select the target code repository, and parse into a bound Document Graph.
         </p>
       </div>
 
       {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+
+      {/* Target Repository Selection (Mandatory) */}
+      <div className="bg-zinc-800/40 border border-zinc-700/80 rounded-xl p-5 space-y-2">
+        <label className="text-xs font-bold text-zinc-200 uppercase tracking-wider flex items-center gap-2">
+          <FolderOpen className="w-4 h-4 text-indigo-400" />
+          Target Repository Snapshot (Required)
+        </label>
+        <p className="text-xs text-zinc-400">
+          Select an indexed code repository snapshot to bind this document graph cluster.
+        </p>
+        <select
+          value={selectedSnapshotId}
+          onChange={(e) => setSelectedSnapshotId(e.target.value)}
+          className="bg-zinc-900 border border-zinc-700 text-zinc-200 text-xs rounded-lg px-3 py-2 w-full focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono"
+        >
+          {repos.length === 0 && <option value="">No repositories found</option>}
+          {repos.map((repo) => {
+            const isIndexed = Boolean(repo.active_snapshot_id)
+            return (
+              <option
+                key={repo.id}
+                value={repo.active_snapshot_id || ''}
+                disabled={!isIndexed}
+              >
+                {repo.name} {isIndexed ? `(Snapshot: ${repo.active_snapshot_id?.substring(0, 12)}...)` : '(Not indexed — please index repo first)'}
+              </option>
+            )
+          })}
+        </select>
+      </div>
 
       {/* Upload Boxes Side-by-Side */}
       <div className="grid grid-cols-2 gap-6">
@@ -1045,7 +1084,9 @@ export default function DocParsingScreen(): React.ReactElement {
         <div className="flex items-center gap-4">
           {!canStartParsing && !parsing && (
             <span className="text-xs text-amber-400/90 font-medium">
-              Add ≥1 DD and exactly 1 BD
+              {!selectedSnapshotId
+                ? 'Select an indexed target repository first'
+                : 'Add ≥1 DD and exactly 1 BD'}
             </span>
           )}
 
@@ -1053,6 +1094,7 @@ export default function DocParsingScreen(): React.ReactElement {
             onClick={handleStartParsing}
             disabled={!canStartParsing}
             className="bg-indigo-600 hover:bg-indigo-500 text-white gap-2 font-semibold px-6"
+            title={!selectedSnapshotId ? 'Select an indexed repository before parsing' : undefined}
           >
             {parsing ? (
               <>

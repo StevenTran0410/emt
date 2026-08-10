@@ -1,6 +1,12 @@
 """COBOL adapter package for CodeSpectra structural graph."""
 
-from .extract import CobolCallFact, CobolCopyFact, CobolExtractionResult, extract_cobol_all, extract_cobol_facts
+from .extract import (
+    CobolCallFact,
+    CobolCopyFact,
+    CobolExtractionResult,
+    extract_cobol_all,
+    extract_cobol_facts,
+)
 from .preprocess import normalize_cobol_text
 from .resolve import (
     ResolvedCobolEdge,

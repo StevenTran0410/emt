@@ -8,6 +8,44 @@ from shared.utils import utc_now_iso
 
 from ._path_resolve import _is_init_file
 
+SYSTEM_COPYBOOK_PREFIXES = ("CMQ", "DFH", "IGZ", "CEE", "DSN", "ELX")
+EXTERNAL_RUNTIMES = {"CEE3ABD", "CBLTDLI", "DFHEI1", "CEETEST"}
+
+
+def _classify_resolution_class(dst: str, res_m: str) -> str:
+    """Classify resolution class for edge targets in graph export."""
+    if res_m == "external_utility":
+        return "predefined_utility"
+    if res_m in {"symbolic_program", "symbolic_dsn", "jcl_back_reference"}:
+        return "unresolved_symbolic"
+    if res_m == "system_copybook" or dst.startswith("__external__/copybook/"):
+        return "system_copybook"
+
+    stem = dst.rsplit("/", 1)[-1].rsplit(".", 1)[0].upper()
+    if stem.startswith(SYSTEM_COPYBOOK_PREFIXES):
+        return "system_copybook"
+    if stem in EXTERNAL_RUNTIMES or stem.startswith("MQ") or stem.startswith("DFH") or res_m == "external_runtime":
+        return "external_runtime"
+
+    if res_m in {
+        "program_not_in_snapshot",
+        "copybook_not_found",
+        "proc_not_in_snapshot",
+        "ambiguous_program_id",
+        "ambiguous_copybook",
+        "ambiguous_proc",
+    }:
+        if stem.startswith("CEE") or stem.startswith("CBL") or stem.startswith("DFH") or stem.startswith("MQ"):
+            return "external_runtime"
+        return "not_in_snapshot"
+
+    if dst.startswith("__unresolved__/"):
+        return "unresolved_symbolic" if ("&" in dst or "%26" in dst) else "not_in_snapshot"
+    if dst.startswith("__external__/"):
+        return "external_runtime"
+
+    return "resolved"
+
 
 class _ExportMixin:
     async def export_graph_json(self, snapshot_id: str) -> dict:
@@ -78,6 +116,7 @@ class _ExportMixin:
             edge_type = r["edge_type"] if "edge_type" in r and r["edge_type"] else "import"
             conf = float(r["confidence_score"]) if "confidence_score" in r and r["confidence_score"] is not None else 1.0
             res_m = r["resolution_method"] if "resolution_method" in r and r["resolution_method"] else "import_statement"
+            res_class = _classify_resolution_class(r["dst_path"], res_m)
 
             key = (r["src_path"], r["dst_path"], edge_type, bool(r["is_external"]))
             if key not in seen_edges:
@@ -89,6 +128,7 @@ class _ExportMixin:
                     "external": key[3],
                     "confidence_score": conf,
                     "resolution_method": res_m,
+                    "resolution_class": res_class,
                 })
 
         communities: dict[str, int] = {}

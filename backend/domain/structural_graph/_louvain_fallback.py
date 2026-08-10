@@ -18,7 +18,6 @@ from collections import defaultdict
 
 from shared.logger import logger
 
-
 # ── networkx-backed path ──────────────────────────────────────────────────────
 
 def _louvain_via_networkx(

@@ -43,13 +43,24 @@ async def test_doc_graph_clean_corpus_build_and_acceptance(tmp_path, monkeypatch
     await init_db()
 
     try:
+        db = get_db()
+        await db.execute(
+            """
+            INSERT INTO repo_snapshots (id, local_repo_id, local_path, status, created_at, synced_at)
+            VALUES ('test-snap-1', 'repo-1', '/tmp/repo-1', 'ready', datetime('now'), datetime('now'))
+            """
+        )
+        await db.commit()
+
         docs_dir = stage_fixture_docs(tmp_path / "docs")
 
         from domain.doc_graph.service import DocGraphService
         from domain.doc_graph.types import BuildDocGraphRequest
 
         service = DocGraphService()
-        req = BuildDocGraphRequest(source_dir=str(docs_dir), force_rebuild=True)
+        req = BuildDocGraphRequest(
+            source_dir=str(docs_dir), snapshot_id="test-snap-1", force_rebuild=True
+        )
         summary = await service.build(req)
 
         # 1. Build succeeds
@@ -285,6 +296,15 @@ async def test_doc_graph_synthetic_positive_mismatches(tmp_path, monkeypatch):
     await init_db()
 
     try:
+        db = get_db()
+        await db.execute(
+            """
+            INSERT INTO repo_snapshots (id, local_repo_id, local_path, status, created_at, synced_at)
+            VALUES ('test-snap-1', 'repo-1', '/tmp/repo-1', 'ready', datetime('now'), datetime('now'))
+            """
+        )
+        await db.commit()
+
         docs_dir = stage_fixture_docs(tmp_path / "docs_synth")
         bd_path = docs_dir / "GEN.BD-CREASTMT.report.md"
         original_bd = bd_path.read_text(encoding="utf-8")
@@ -303,7 +323,9 @@ async def test_doc_graph_synthetic_positive_mismatches(tmp_path, monkeypatch):
         bd_path.write_text(synthetic_bd_1, encoding="utf-8")
 
         summary1 = await service.build(
-            BuildDocGraphRequest(source_dir=str(docs_dir), force_rebuild=True)
+            BuildDocGraphRequest(
+                source_dir=str(docs_dir), snapshot_id="test-snap-1", force_rebuild=True
+            )
         )
         mismatches1 = await service.mismatches(summary1.cluster_id)
         existence_mismatches = [m for m in mismatches1.mismatches if m.mismatch_type == "existence"]
@@ -322,7 +344,9 @@ async def test_doc_graph_synthetic_positive_mismatches(tmp_path, monkeypatch):
         bd_path.write_text(synthetic_bd_2, encoding="utf-8")
 
         summary2 = await service.build(
-            BuildDocGraphRequest(source_dir=str(docs_dir), force_rebuild=True)
+            BuildDocGraphRequest(
+                source_dir=str(docs_dir), snapshot_id="test-snap-1", force_rebuild=True
+            )
         )
         mismatches2 = await service.mismatches(summary2.cluster_id)
         broken_cites = [m for m in mismatches2.mismatches if m.mismatch_type == "broken_citation"]
@@ -344,7 +368,9 @@ async def test_doc_graph_synthetic_positive_mismatches(tmp_path, monkeypatch):
         bd_path.write_text(synthetic_bd_3, encoding="utf-8")
 
         summary3 = await service.build(
-            BuildDocGraphRequest(source_dir=str(docs_dir), force_rebuild=True)
+            BuildDocGraphRequest(
+                source_dir=str(docs_dir), snapshot_id="test-snap-1", force_rebuild=True
+            )
         )
         mismatches3 = await service.mismatches(summary3.cluster_id)
         rel_errors = [
@@ -367,7 +393,9 @@ async def test_doc_graph_synthetic_positive_mismatches(tmp_path, monkeypatch):
         bd_path.write_text(synthetic_bd_3b, encoding="utf-8")
 
         summary3b = await service.build(
-            BuildDocGraphRequest(source_dir=str(docs_dir), force_rebuild=True)
+            BuildDocGraphRequest(
+                source_dir=str(docs_dir), snapshot_id="test-snap-1", force_rebuild=True
+            )
         )
         mismatches3b = await service.mismatches(summary3b.cluster_id)
         rel_errors_3b = [
@@ -393,7 +421,9 @@ async def test_doc_graph_synthetic_positive_mismatches(tmp_path, monkeypatch):
         bd_path.write_text(synthetic_bd_4, encoding="utf-8")
 
         summary4 = await service.build(
-            BuildDocGraphRequest(source_dir=str(docs_dir), force_rebuild=True)
+            BuildDocGraphRequest(
+                source_dir=str(docs_dir), snapshot_id="test-snap-1", force_rebuild=True
+            )
         )
         mismatches4 = await service.mismatches(summary4.cluster_id)
         val_mismatches = [m for m in mismatches4.mismatches if m.mismatch_type == "value"]
@@ -418,6 +448,15 @@ async def test_doc_graph_caching_and_robustness(tmp_path, monkeypatch):
     await init_db()
 
     try:
+        db = get_db()
+        await db.execute(
+            """
+            INSERT INTO repo_snapshots (id, local_repo_id, local_path, status, created_at, synced_at)
+            VALUES ('test-snap-1', 'repo-1', '/tmp/repo-1', 'ready', datetime('now'), datetime('now'))
+            """
+        )
+        await db.commit()
+
         docs_dir = stage_fixture_docs(tmp_path / "docs_robust")
 
         from domain.doc_graph.service import DocGraphService
@@ -426,7 +465,7 @@ async def test_doc_graph_caching_and_robustness(tmp_path, monkeypatch):
         service = DocGraphService()
 
         # 1. Build initial
-        req = BuildDocGraphRequest(source_dir=str(docs_dir))
+        req = BuildDocGraphRequest(source_dir=str(docs_dir), snapshot_id="test-snap-1")
         sum1 = await service.build(req)
 
         # 2. Repeat build without force_rebuild -> returns cached
@@ -445,7 +484,9 @@ async def test_doc_graph_caching_and_robustness(tmp_path, monkeypatch):
 
         # 4. T5 & §7.7: DD order independence (force_rebuild yields identical summary)
         sum4 = await service.build(
-            BuildDocGraphRequest(source_dir=str(docs_dir), force_rebuild=True)
+            BuildDocGraphRequest(
+                source_dir=str(docs_dir), snapshot_id="test-snap-1", force_rebuild=True
+            )
         )
         assert sum4.document_count == sum1.document_count
         assert sum4.node_count == sum1.node_count
@@ -462,7 +503,9 @@ async def test_doc_graph_caching_and_robustness(tmp_path, monkeypatch):
         shutil.copy(SOURCE_DOCS_DIR / FIXTURE_FILES[0], docs_dir_b / FIXTURE_FILES[0])
 
         sum_shuffled = await service.build(
-            BuildDocGraphRequest(source_dir=str(docs_dir_b), force_rebuild=True)
+            BuildDocGraphRequest(
+                source_dir=str(docs_dir_b), snapshot_id="test-snap-1", force_rebuild=True
+            )
         )
         nodes_a = await service.nodes(sum1.cluster_id, limit=500)
         nodes_b = await service.nodes(sum_shuffled.cluster_id, limit=500)
@@ -480,7 +523,9 @@ async def test_doc_graph_caching_and_robustness(tmp_path, monkeypatch):
         malformed_content = "# Basic Design — CREASTMT\n\nNo structured tables here.\n"
         malformed_bd.write_text(malformed_content, encoding="utf-8")
         sum5 = await service.build(
-            BuildDocGraphRequest(source_dir=str(docs_dir), force_rebuild=True)
+            BuildDocGraphRequest(
+                source_dir=str(docs_dir), snapshot_id="test-snap-1", force_rebuild=True
+            )
         )
         assert sum5.document_count == 4
         assert sum5.cluster_id is not None
@@ -504,7 +549,8 @@ async def test_doc_graph_caching_and_robustness(tmp_path, monkeypatch):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp_build = await client.post(
-                "/api/doc-graph/build", json={"source_dir": str(docs_dir)}
+                "/api/doc-graph/build",
+                json={"source_dir": str(docs_dir), "snapshot_id": "test-snap-1"},
             )
             assert resp_build.status_code == 200
             data = resp_build.json()
@@ -554,6 +600,15 @@ async def test_doc_graph_llm_citation_tier(tmp_path, monkeypatch):
     await init_db()
 
     try:
+        db = get_db()
+        await db.execute(
+            """
+            INSERT INTO repo_snapshots (id, local_repo_id, local_path, status, created_at, synced_at)
+            VALUES ('test-snap-1', 'repo-1', '/tmp/repo-1', 'ready', datetime('now'), datetime('now'))
+            """
+        )
+        await db.commit()
+
         docs_dir = stage_fixture_docs(tmp_path / "docs_llm")
 
         from domain.doc_graph.service import DocGraphService
@@ -588,7 +643,12 @@ async def test_doc_graph_llm_citation_tier(tmp_path, monkeypatch):
 
         # (e) llm_enabled=False -> 0 LLM mismatches
         sum_no_llm = await service.build(
-            BuildDocGraphRequest(source_dir=str(docs_dir), llm_enabled=False, force_rebuild=True)
+            BuildDocGraphRequest(
+                source_dir=str(docs_dir),
+                snapshot_id="test-snap-1",
+                llm_enabled=False,
+                force_rebuild=True,
+            )
         )
         mms_no_llm = await service.mismatches(sum_no_llm.cluster_id)
         assert not any(m.derivation == "llm" for m in mms_no_llm.mismatches)
@@ -612,7 +672,9 @@ async def test_doc_graph_llm_citation_tier(tmp_path, monkeypatch):
         monkeypatch.setattr(ProviderConfigService, "chat", mock_chat_contradicted)
 
         sum_contra = await service.build(
-            BuildDocGraphRequest(source_dir=str(docs_dir), force_rebuild=True)
+            BuildDocGraphRequest(
+                source_dir=str(docs_dir), snapshot_id="test-snap-1", force_rebuild=True
+            )
         )
         mms_contra = await service.mismatches(sum_contra.cluster_id)
         llm_mms = [m for m in mms_contra.mismatches if m.derivation == "llm"]
@@ -624,7 +686,9 @@ async def test_doc_graph_llm_citation_tier(tmp_path, monkeypatch):
         # (f) Caching check: re-building cluster reuses cached verdict without re-calling chat stub
         initial_calls = call_count
         await service.build(
-            BuildDocGraphRequest(source_dir=str(docs_dir), force_rebuild=True)
+            BuildDocGraphRequest(
+                source_dir=str(docs_dir), snapshot_id="test-snap-1", force_rebuild=True
+            )
         )
         assert call_count == initial_calls, "Cached verdicts should prevent extra LLM chat calls"
 
@@ -648,7 +712,9 @@ async def test_doc_graph_llm_citation_tier(tmp_path, monkeypatch):
         await db.commit()
 
         sum_insuff = await service.build(
-            BuildDocGraphRequest(source_dir=str(docs_dir), force_rebuild=True)
+            BuildDocGraphRequest(
+                source_dir=str(docs_dir), snapshot_id="test-snap-1", force_rebuild=True
+            )
         )
         mms_insuff = await service.mismatches(sum_insuff.cluster_id)
         llm_mms_insuff = [m for m in mms_insuff.mismatches if m.derivation == "llm"]
@@ -674,7 +740,9 @@ async def test_doc_graph_llm_citation_tier(tmp_path, monkeypatch):
         await db.commit()
 
         sum_full = await service.build(
-            BuildDocGraphRequest(source_dir=str(docs_dir), force_rebuild=True)
+            BuildDocGraphRequest(
+                source_dir=str(docs_dir), snapshot_id="test-snap-1", force_rebuild=True
+            )
         )
         mms_full = await service.mismatches(sum_full.cluster_id)
         assert not any(m.derivation == "llm" for m in mms_full.mismatches)
@@ -690,7 +758,9 @@ async def test_doc_graph_llm_citation_tier(tmp_path, monkeypatch):
         await db.commit()
 
         sum_malformed = await service.build(
-            BuildDocGraphRequest(source_dir=str(docs_dir), force_rebuild=True)
+            BuildDocGraphRequest(
+                source_dir=str(docs_dir), snapshot_id="test-snap-1", force_rebuild=True
+            )
         )
         mms_malformed = await service.mismatches(sum_malformed.cluster_id)
         llm_mms_mal = [m for m in mms_malformed.mismatches if m.derivation == "llm"]
@@ -720,3 +790,32 @@ async def test_doc_graph_llm_citation_tier(tmp_path, monkeypatch):
 
     finally:
         await close_db()
+
+
+@pytest.mark.asyncio
+async def test_doc_graph_requires_snapshot_id(tmp_path, monkeypatch):
+    """Test that building a doc graph without a valid snapshot_id raises a ValueError."""
+    db_dir = tmp_path / "db"
+    db_dir.mkdir()
+    monkeypatch.setenv("CODESPECTRA_DATA_DIR", str(db_dir))
+
+    await init_db()
+    try:
+        docs_dir = stage_fixture_docs(tmp_path / "docs_val")
+        from domain.doc_graph.service import DocGraphService
+        from domain.doc_graph.types import BuildDocGraphRequest
+
+        service = DocGraphService()
+
+        # 1. Missing snapshot_id (None) -> raises ValueError
+        with pytest.raises(ValueError, match="snapshot_id is required"):
+            await service.build(BuildDocGraphRequest(source_dir=str(docs_dir), snapshot_id=None))
+
+        # 2. Non-existent snapshot_id -> raises ValueError
+        with pytest.raises(ValueError, match="does not exist in repo_snapshots"):
+            await service.build(
+                BuildDocGraphRequest(source_dir=str(docs_dir), snapshot_id="non-existent-snap")
+            )
+    finally:
+        await close_db()
+

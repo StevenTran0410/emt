@@ -122,7 +122,9 @@ const api = {
   },
   docCode: {
     compare: invoke('docCode:compare'),
-    compareRelations: invoke('docCode:compareRelations')
+    compareRelations: invoke('docCode:compareRelations'),
+    assess: invoke('docCode:assess'),
+    getAssessment: invoke('docCode:getAssessment')
   },
   query: {
     exportCsv: invoke('query:exportCsv')

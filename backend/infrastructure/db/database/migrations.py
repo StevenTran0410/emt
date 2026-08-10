@@ -463,6 +463,25 @@ CREATE TABLE IF NOT EXISTS doc_code_relation_evidence (
 CREATE INDEX IF NOT EXISTS ix_dcrc ON doc_code_relation_comparisons(cluster_id, snapshot_id);
         """,
     },
+    {
+        "version": 5,
+        "description": "Add doc_code_assessments for Stage X.5 AI Assessment persistence",
+        "sql": """
+CREATE TABLE IF NOT EXISTS doc_code_assessments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  cluster_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  comparator_version TEXT NOT NULL DEFAULT '1.0.0',
+  evidence_hash TEXT NOT NULL,
+  model TEXT NOT NULL,
+  assessment_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(cluster_id, snapshot_id, evidence_hash, model)
+);
+
+CREATE INDEX IF NOT EXISTS ix_doc_code_assessments_cs ON doc_code_assessments(cluster_id, snapshot_id);
+        """,
+    },
 ]
 
 TARGET_VERSION = len(_MIGRATIONS) - 1

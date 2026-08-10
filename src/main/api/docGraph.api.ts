@@ -57,7 +57,7 @@ export function registerDocGraphHandlers(client: BackendClient): void {
     'docGraph:stageAndBuild',
     async (
       _e,
-      body: { files: string[]; force_rebuild?: boolean; llm_enabled?: boolean }
+      body: { files: string[]; snapshot_id?: string | null; force_rebuild?: boolean; llm_enabled?: boolean }
     ) => {
       const fs = await import('node:fs/promises')
       const os = await import('node:os')
@@ -70,6 +70,7 @@ export function registerDocGraphHandlers(client: BackendClient): void {
         '/api/doc-graph/build',
         {
           source_dir: dir,
+          snapshot_id: body.snapshot_id ?? null,
           force_rebuild: body.force_rebuild ?? true,
           llm_enabled: body.llm_enabled ?? true
         },
@@ -82,7 +83,7 @@ export function registerDocGraphHandlers(client: BackendClient): void {
     'docGraph:buildStream',
     async (
       _e,
-      body: { files: string[]; force_rebuild?: boolean; llm_enabled?: boolean }
+      body: { files: string[]; snapshot_id?: string | null; force_rebuild?: boolean; llm_enabled?: boolean }
     ) => {
       const fs = await import('node:fs/promises')
       const os = await import('node:os')
@@ -95,6 +96,7 @@ export function registerDocGraphHandlers(client: BackendClient): void {
         '/api/doc-graph/build-stream',
         {
           source_dir: dir,
+          snapshot_id: body.snapshot_id ?? null,
           force_rebuild: body.force_rebuild ?? true,
           llm_enabled: body.llm_enabled ?? true
         },

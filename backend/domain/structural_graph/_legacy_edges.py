@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from typing import NamedTuple, Any
+from typing import Any, NamedTuple
 
 
 class GraphEdgeRows(NamedTuple):

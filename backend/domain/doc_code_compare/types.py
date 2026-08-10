@@ -112,3 +112,49 @@ class DocCodeRelationCompareResponse(BaseModel):
         "access_mode_correctness",
     ]
     summary: RelationSummary
+
+
+# ── AI Assessment Types ──
+
+
+class AssessDocCodeRequest(BaseModel):
+    cluster_id: str
+    snapshot_id: str
+    provider_id: str | None = None
+
+
+class AiEvidenceRef(BaseModel):
+    kind: Literal["entity", "relation", "file"]
+    ref: str
+
+
+class AiConcern(BaseModel):
+    severity: Literal["error", "warning", "info"]
+    title: str
+    detail: str
+    evidence_refs: list[AiEvidenceRef] = Field(default_factory=list)
+    recommendation: str
+
+
+class AiAssessmentData(BaseModel):
+    overall_verdict: Literal["ADEQUATE", "GAPS_FOUND", "INSUFFICIENT_EVIDENCE"]
+    confidence: Literal["low", "medium", "high"]
+    completeness_note: str
+    correctness_note: str
+    concerns: list[AiConcern] = Field(default_factory=list)
+    caveats: list[str] = Field(default_factory=list)
+
+
+class AiAssessmentResponse(BaseModel):
+    cluster_id: str
+    snapshot_id: str
+    overall_verdict: Literal["ADEQUATE", "GAPS_FOUND", "INSUFFICIENT_EVIDENCE"]
+    confidence: Literal["low", "medium", "high"]
+    completeness_note: str
+    correctness_note: str
+    concerns: list[AiConcern] = Field(default_factory=list)
+    caveats: list[str] = Field(default_factory=list)
+    model: str
+    generated_at: str
+    from_cache: bool = False
+    stale: bool = False

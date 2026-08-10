@@ -1,14 +1,18 @@
 """Service implementing Doc↔Code completeness & Structural Link comparison algorithms."""
 
+import hashlib
 import json
 import re
 from datetime import UTC, datetime
 from typing import Any
 
 from infrastructure.db.database import get_db
+from shared.utils import utc_now_iso
 
 from .relation_adapter import CanonicalCodeRelation, load_canonical_code_relations
 from .types import (
+    AiAssessmentResponse,
+    AiConcern,
     ComparisonSummary,
     DocCodeCompareResponse,
     DocCodeRelationCompareResponse,
@@ -19,6 +23,205 @@ from .types import (
     RelationSummary,
     TypeComparisonResult,
 )
+
+
+def _parse_llm_json(text: str | None) -> dict[str, Any]:
+    """Tolerantly parse JSON output from LLM."""
+    if not text:
+        raise ValueError("empty LLM content")
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("```", 2)[1] if t.count("```") >= 2 else t.strip("`")
+        if t.lstrip().lower().startswith("json"):
+            t = t.lstrip()[4:]
+    a, b = t.find("{"), t.rfind("}")
+    if a != -1 and b != -1 and b > a:
+        t = t[a : b + 1]
+    return json.loads(t)
+
+
+_VERDICTS = {"ADEQUATE", "GAPS_FOUND", "INSUFFICIENT_EVIDENCE"}
+_CONFIDENCES = {"low", "medium", "high"}
+_SEVERITIES = {"error", "warning", "info"}
+_REF_KINDS = {"entity", "relation", "file"}
+
+
+def _coerce_ref_kind(ref: str) -> str:
+    r = ref or ""
+    if "->" in r:
+        return "relation"
+    if ":" in r or r.upper().endswith((".CBL", ".JCL", ".PRC", ".CPY", ".DCL", ".COB")):
+        return "file"
+    return "entity"
+
+
+def _normalize_llm_assessment(parsed: Any) -> dict[str, Any]:
+    """Coerce a raw LLM object into the strict AiAssessmentResponse shape.
+
+    LLMs routinely drift from the schema (bare-string evidence_refs, unknown enum
+    values, missing fields). Normalising here keeps the endpoint from 500-ing on
+    reasonable-but-imperfect output; the surfaced error would otherwise be a raw
+    pydantic validation dump.
+    """
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    verdict = str(parsed.get("overall_verdict", "")).upper().replace(" ", "_")
+    if verdict not in _VERDICTS:
+        verdict = "INSUFFICIENT_EVIDENCE"
+
+    confidence = str(parsed.get("confidence", "")).lower()
+    if confidence not in _CONFIDENCES:
+        confidence = "low"
+
+    concerns_out: list[dict[str, Any]] = []
+    for c in parsed.get("concerns", []) or []:
+        if not isinstance(c, dict):
+            continue
+        sev = str(c.get("severity", "")).lower()
+        if sev not in _SEVERITIES:
+            sev = "info"
+        refs_out: list[dict[str, str]] = []
+        for r in c.get("evidence_refs", []) or []:
+            if isinstance(r, str):
+                refs_out.append({"kind": _coerce_ref_kind(r), "ref": r})
+            elif isinstance(r, dict):
+                ref_val = str(r.get("ref", "") or "")
+                kind = str(r.get("kind", "")).lower()
+                if kind not in _REF_KINDS:
+                    kind = _coerce_ref_kind(ref_val)
+                refs_out.append({"kind": kind, "ref": ref_val})
+        concerns_out.append({
+            "severity": sev,
+            "title": str(c.get("title", "") or ""),
+            "detail": str(c.get("detail", "") or ""),
+            "evidence_refs": refs_out,
+            "recommendation": str(c.get("recommendation", "") or ""),
+        })
+
+    caveats = [str(x) for x in (parsed.get("caveats", []) or []) if x is not None]
+
+    return {
+        "overall_verdict": verdict,
+        "confidence": confidence,
+        "completeness_note": str(parsed.get("completeness_note", "") or ""),
+        "correctness_note": str(parsed.get("correctness_note", "") or ""),
+        "concerns": concerns_out,
+        "caveats": caveats,
+    }
+
+
+def _build_evidence_payload(
+    entity_res: DocCodeCompareResponse, relation_res: DocCodeRelationCompareResponse
+) -> dict[str, Any]:
+    per_type_evidence = []
+    for pt in entity_res.per_type:
+        # Use the canonical namespace key (e.g. "dd/CUSTFILE", "program/X") so the LLM's
+        # evidence_refs resolve back to the Panel A rows keyed by the same value.
+        undoc_keys = [x.get("key", "") for x in pt.undocumented]
+        missing_keys = [x.get("key", "") for x in pt.missing]
+        unknown_keys = [x.get("key", "") for x in pt.unknown]
+
+        per_type_evidence.append({
+            "type": pt.type,
+            "doc_count": pt.doc_count,
+            "code_count": pt.code_count,
+            "matched": pt.matched,
+            "undocumented_keys": undoc_keys[:50],
+            "undocumented_truncated": max(0, len(undoc_keys) - 50),
+            "missing_keys": missing_keys[:50],
+            "missing_truncated": max(0, len(missing_keys) - 50),
+            "unknown_keys": unknown_keys[:50],
+            "unknown_truncated": max(0, len(unknown_keys) - 50),
+        })
+
+    per_pred_evidence = []
+    for pr in relation_res.per_predicate:
+        details_summary = []
+        for d in pr.details:
+            details_summary.append({
+                "subject_key": d.subject_key,
+                "object_key": d.object_key,
+                "endpoint_verdict": d.endpoint_verdict,
+                "multiplicity_verdict": d.multiplicity_verdict,
+                "doc_count": d.doc_count,
+                "code_count": d.code_count,
+                "eligibility": d.eligibility,
+                "reason": d.reason,
+            })
+        per_pred_evidence.append({
+            "predicate": pr.predicate,
+            "matched": pr.matched,
+            "doc_only": pr.doc_only,
+            "code_only": pr.code_only,
+            "unknown": pr.unknown,
+            "details": details_summary[:50],
+            "details_truncated": max(0, len(details_summary) - 50),
+        })
+
+    return {
+        "cluster_id": entity_res.cluster_id,
+        "snapshot_id": entity_res.snapshot_id,
+        "eligibility": {
+            "authoritative": entity_res.eligibility.authoritative,
+            "reason": entity_res.eligibility.reason,
+        },
+        "entity_summary": {
+            "matched": entity_res.summary.matched,
+            "undocumented": entity_res.summary.undocumented,
+            "missing": entity_res.summary.missing,
+            "unknown": entity_res.summary.unknown,
+        },
+        "per_type": per_type_evidence,
+        "relation_summary": {
+            "matched": relation_res.summary.matched,
+            "doc_only": relation_res.summary.doc_only,
+            "code_only": relation_res.summary.code_only,
+            "unknown": relation_res.summary.unknown,
+        },
+        "per_predicate": per_pred_evidence,
+        "not_assessed_entities": entity_res.not_assessed,
+        "not_assessed_relations": relation_res.not_assessed,
+    }
+
+
+def _compute_evidence_hash(evidence_payload: dict[str, Any]) -> str:
+    canonical = json.dumps(evidence_payload, sort_keys=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+AI_ASSESSMENT_SYSTEM_PROMPT = """You are an expert mainframes software documentation validation auditor.
+Your job is to judge whether the technical documentation (BD/DD documents) is adequate, accurate, and complete with respect to the actual implementation code, using ONLY the provided deterministic comparison evidence.
+
+STRICT AUDIT RULES:
+1. Judge ONLY from the provided evidence payload. NEVER invent entities, relations, counts, or file paths not present in the evidence.
+2. Every concern in the "concerns" list MUST cite at least one valid evidence reference in "evidence_refs" pointing to an entity key (e.g. "dd/CUSTFILE"), a relation key (e.g. "calls program/CBSTM03A -> program/CBSTM03B"), or a file path (e.g. "app/cbl/CBSTM03A.CBL:44").
+3. If `eligibility.authoritative` is false, you MUST set confidence to at most "medium" and add a caveat explaining that the source parse was non-authoritative.
+4. Provide structured output adhering strictly to the JSON schema below.
+
+JSON OUTPUT SCHEMA:
+{
+  "overall_verdict": "ADEQUATE" | "GAPS_FOUND" | "INSUFFICIENT_EVIDENCE",
+  "confidence": "low" | "medium" | "high",
+  "completeness_note": "1-3 sentences grounded in Panel A numbers",
+  "correctness_note": "1-3 sentences grounded in Panel B relation verdicts",
+  "concerns": [
+    {
+      "severity": "error" | "warning" | "info",
+      "title": "short concern title",
+      "detail": "explanation of concern grounded in evidence",
+      "evidence_refs": [
+        {
+          "kind": "entity" | "relation" | "file",
+          "ref": "string key from evidence"
+        }
+      ],
+      "recommendation": "suggested action to fix documentation or code link"
+    }
+  ],
+  "caveats": ["string list of caveats, e.g. non-authoritative parse warnings"]
+}
+"""
 
 
 class DocCodeCompareService:
@@ -616,4 +819,157 @@ class DocCodeCompareService:
                 code_only=total_code_only,
                 unknown=total_unknown,
             ),
+        )
+
+    async def assess(
+        self, cluster_id: str, snapshot_id: str, provider_id: str | None = None
+    ) -> AiAssessmentResponse:
+        db = get_db()
+        entity_res = await self.compare(cluster_id, snapshot_id)
+        relation_res = await self.compare_relations(cluster_id, snapshot_id)
+
+        evidence = _build_evidence_payload(entity_res, relation_res)
+        ev_hash = _compute_evidence_hash(evidence)
+
+        # Resolve provider
+        from domain.model_connector.service import ProviderConfigService
+        from domain.model_connector.types import ChatMessage, ChatRequest
+
+        provider_svc = ProviderConfigService()
+        prov_id: str | None = None
+        model_name = "default-llm"
+
+        if provider_id:
+            try:
+                cfg = await provider_svc.get_by_id(provider_id)
+                prov_id = cfg.id
+                model_name = cfg.model_id
+            except Exception:
+                pass
+        else:
+            configs = await provider_svc.list_all()
+            chat_cfg = next((c for c in configs if not c.capabilities.embeddings), None)
+            if chat_cfg:
+                prov_id = chat_cfg.id
+                model_name = chat_cfg.model_id
+
+        # Check cache
+        async with db.execute(
+            """
+            SELECT assessment_json, created_at, model
+            FROM doc_code_assessments
+            WHERE cluster_id=? AND snapshot_id=? AND evidence_hash=? AND model=?
+            """,
+            (cluster_id, snapshot_id, ev_hash, model_name),
+        ) as cur:
+            row = await cur.fetchone()
+
+        if row is not None:
+            data = json.loads(row["assessment_json"])
+            return AiAssessmentResponse(
+                cluster_id=cluster_id,
+                snapshot_id=snapshot_id,
+                overall_verdict=data.get("overall_verdict", "INSUFFICIENT_EVIDENCE"),
+                confidence=data.get("confidence", "low"),
+                completeness_note=data.get("completeness_note", ""),
+                correctness_note=data.get("correctness_note", ""),
+                concerns=[AiConcern(**c) for c in data.get("concerns", [])],
+                caveats=data.get("caveats", []),
+                model=row["model"],
+                generated_at=row["created_at"],
+                from_cache=True,
+                stale=False,
+            )
+
+        # Call LLM
+        user_prompt = f"EVIDENCE PAYLOAD:\n{json.dumps(evidence, indent=2)}"
+        chat_req = ChatRequest(
+            provider_id=prov_id or "default",
+            messages=[
+                ChatMessage(role="system", content=AI_ASSESSMENT_SYSTEM_PROMPT),
+                ChatMessage(role="user", content=user_prompt),
+            ],
+            json_mode=True,
+        )
+
+        resp = await provider_svc.chat(chat_req)
+        parsed = _normalize_llm_assessment(_parse_llm_json(resp.content))
+
+        # Enforce non-authoritative caveat and confidence capping if applicable
+        if not entity_res.eligibility.authoritative:
+            if parsed.get("confidence") == "high":
+                parsed["confidence"] = "medium"
+            caveats = parsed.setdefault("caveats", [])
+            caveat_msg = f"Non-authoritative parse: {entity_res.eligibility.reason}"
+            if caveat_msg not in caveats:
+                caveats.append(caveat_msg)
+
+        now = utc_now_iso()
+        assessment_json_str = json.dumps(parsed)
+
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO doc_code_assessments
+            (cluster_id, snapshot_id, comparator_version, evidence_hash, model, assessment_json, created_at)
+            VALUES (?, ?, '1.0.0', ?, ?, ?, ?)
+            """,
+            (cluster_id, snapshot_id, ev_hash, model_name, assessment_json_str, now),
+        )
+        await db.commit()
+
+        return AiAssessmentResponse(
+            cluster_id=cluster_id,
+            snapshot_id=snapshot_id,
+            overall_verdict=parsed.get("overall_verdict", "INSUFFICIENT_EVIDENCE"),
+            confidence=parsed.get("confidence", "low"),
+            completeness_note=parsed.get("completeness_note", ""),
+            correctness_note=parsed.get("correctness_note", ""),
+            concerns=[AiConcern(**c) for c in parsed.get("concerns", [])],
+            caveats=parsed.get("caveats", []),
+            model=model_name,
+            generated_at=now,
+            from_cache=False,
+            stale=False,
+        )
+
+    async def get_latest_assessment(
+        self, cluster_id: str, snapshot_id: str
+    ) -> AiAssessmentResponse | None:
+        db = get_db()
+        async with db.execute(
+            """
+            SELECT evidence_hash, model, assessment_json, created_at
+            FROM doc_code_assessments
+            WHERE cluster_id=? AND snapshot_id=?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (cluster_id, snapshot_id),
+        ) as cur:
+            row = await cur.fetchone()
+
+        if row is None:
+            return None
+
+        # Check if stale compared to live evidence
+        entity_res = await self.compare(cluster_id, snapshot_id)
+        relation_res = await self.compare_relations(cluster_id, snapshot_id)
+        live_evidence = _build_evidence_payload(entity_res, relation_res)
+        live_hash = _compute_evidence_hash(live_evidence)
+
+        stale = row["evidence_hash"] != live_hash
+        data = json.loads(row["assessment_json"])
+
+        return AiAssessmentResponse(
+            cluster_id=cluster_id,
+            snapshot_id=snapshot_id,
+            overall_verdict=data.get("overall_verdict", "INSUFFICIENT_EVIDENCE"),
+            confidence=data.get("confidence", "low"),
+            completeness_note=data.get("completeness_note", ""),
+            correctness_note=data.get("correctness_note", ""),
+            concerns=[AiConcern(**c) for c in data.get("concerns", [])],
+            caveats=data.get("caveats", []),
+            model=row["model"],
+            generated_at=row["created_at"],
+            from_cache=True,
+            stale=stale,
         )

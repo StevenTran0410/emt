@@ -84,7 +84,6 @@ class _BuildMixin:
             files = await cur.fetchall()
 
         file_set = {r["rel_path"] for r in files}
-        test_file_set = {r["rel_path"] for r in files if r["category"] == "test"}
 
         py_suffix_index = _build_py_suffix_index(file_set)
 
@@ -149,6 +148,7 @@ class _BuildMixin:
         copybook_index: dict[str, list[str]] = {}
         cobol_facts_cache: dict[str, Any] = {}
         cobol_enrich_cache: dict[str, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
+        proc_index: dict[str, list[str]] = {}
         if _COBOL_JCL_GRAPH_ENABLED:
             from .._cobol import (
                 build_copybook_index,
@@ -156,6 +156,8 @@ class _BuildMixin:
                 extract_cobol_all,
                 extract_cobol_facts,
             )
+            from .._jcl import build_proc_index
+
             extracted_program_ids: dict[str, str | None] = {}
             for r in files:
                 if r["language"] == "cobol" and r["category"] in {"source", "infra"}:
@@ -175,6 +177,7 @@ class _BuildMixin:
 
             cobol_program_index = build_program_index(extracted_program_ids)
             copybook_index = build_copybook_index(file_set)
+            proc_index = build_proc_index(file_set)
 
         for r in files_to_process:
             rel_path = r["rel_path"]
@@ -225,7 +228,7 @@ class _BuildMixin:
                 from .._legacy_edges import convert_resolved_edges_to_rows
 
                 j_res = extract_jcl_facts(content)
-                j_execs = resolve_jcl_execs(rel_path, j_res.execs, cobol_program_index)
+                j_execs = resolve_jcl_execs(rel_path, j_res.execs, cobol_program_index, proc_index)
                 j_dds = resolve_jcl_dds(rel_path, j_res.dds)
 
                 j_rows = convert_resolved_edges_to_rows(req.snapshot_id, j_execs + j_dds, now)
@@ -506,8 +509,9 @@ class _BuildMixin:
             logger.info("[structural_graph] SymbolGraphBuilder wiring disabled via SYMBOL_GRAPH_BUILDER_ENABLED")
 
         all_nodes = {
-            f for f in file_set
-            if not _is_init_file(f) and f not in test_file_set
+            r["rel_path"] for r in files
+            if r["category"] in {"source", "infra"}
+            and not _is_init_file(r["rel_path"])
         }
         if native_graph and hasattr(native_graph, "compute_scores"):
             scored_raw = native_graph.compute_scores(sorted(all_nodes), edge_inputs)

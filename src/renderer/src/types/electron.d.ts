@@ -731,6 +731,34 @@ export interface DocCodeRelationCompareResult {
   }
 }
 
+export interface AiEvidenceRef {
+  kind: 'entity' | 'relation' | 'file'
+  ref: string
+}
+
+export interface AiConcern {
+  severity: 'error' | 'warning' | 'info'
+  title: string
+  detail: string
+  evidence_refs: AiEvidenceRef[]
+  recommendation: string
+}
+
+export interface AiAssessmentResult {
+  cluster_id: string
+  snapshot_id: string
+  overall_verdict: 'ADEQUATE' | 'GAPS_FOUND' | 'INSUFFICIENT_EVIDENCE'
+  confidence: 'low' | 'medium' | 'high'
+  completeness_note: string
+  correctness_note: string
+  concerns: AiConcern[]
+  caveats: string[]
+  model: string
+  generated_at: string
+  from_cache: boolean
+  stale: boolean
+}
+
 declare global {
   interface Window {
     api: {
@@ -865,14 +893,16 @@ declare global {
         listClusters: () => Promise<DocGraphClusterSummary[]>
         deleteCluster: (clusterId: string) => Promise<{ ok: boolean }>
         pickFiles: () => Promise<string[]>
-        stageAndBuild: (body: { files: string[]; force_rebuild?: boolean; llm_enabled?: boolean }) => Promise<DocGraphSummary>
-        buildStream: (body: { files: string[]; force_rebuild?: boolean; llm_enabled?: boolean }) => Promise<{ ok: boolean }>
+        stageAndBuild: (body: { files: string[]; snapshot_id?: string | null; force_rebuild?: boolean; llm_enabled?: boolean }) => Promise<DocGraphSummary>
+        buildStream: (body: { files: string[]; snapshot_id?: string | null; force_rebuild?: boolean; llm_enabled?: boolean }) => Promise<{ ok: boolean }>
         onStreamEvent: (handler: (evt: any) => void) => void
         offStreamEvent: (handler: (evt: any) => void) => void
       }
       docCode: {
         compare: (body: { cluster_id: string; snapshot_id: string }) => Promise<DocCodeCompareResult>
         compareRelations: (body: { cluster_id: string; snapshot_id: string }) => Promise<DocCodeRelationCompareResult>
+        assess: (body: { cluster_id: string; snapshot_id: string; provider_id?: string }) => Promise<AiAssessmentResult>
+        getAssessment: (params: { cluster_id: string; snapshot_id: string }) => Promise<AiAssessmentResult | null>
       }
       query: {
         exportCsv: (csv: string, defaultName: string) => Promise<{ saved: boolean; file_path: string | null }>

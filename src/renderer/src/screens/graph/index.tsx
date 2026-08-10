@@ -185,6 +185,32 @@ export default function GraphScreen(): React.ReactElement {
 
   const fitViewOptions = { padding: 0.1 }
 
+  const unresolvedStats = useMemo(() => {
+    if (!graphData?.edges) return { total: 0, symbolic: 0, systemCopybook: 0, notInSnapshot: 0, externalRuntime: 0 }
+    let symbolic = 0
+    let systemCopybook = 0
+    let notInSnapshot = 0
+    let externalRuntime = 0
+
+    for (const e of graphData.edges) {
+      if (e.external) {
+        const cls = e.resolution_class || ''
+        if (cls === 'unresolved_symbolic') symbolic++
+        else if (cls === 'system_copybook') systemCopybook++
+        else if (cls === 'external_runtime') externalRuntime++
+        else if (cls === 'not_in_snapshot') notInSnapshot++
+      }
+    }
+
+    return {
+      total: symbolic + systemCopybook + notInSnapshot,
+      symbolic,
+      systemCopybook,
+      notInSnapshot,
+      externalRuntime
+    }
+  }, [graphData])
+
   if (!snapshotId) {
     return (
       <div className="h-full flex items-center justify-center bg-zinc-950">
@@ -238,13 +264,20 @@ export default function GraphScreen(): React.ReactElement {
       {/* Main canvas area */}
       <div className="flex-1 flex flex-col relative">
         {/* Header */}
-        <div className="px-4 py-3 border-b border-zinc-700 bg-zinc-900 flex items-center justify-between shrink-0">
-          <div className="text-xs text-zinc-300">
-            Graph ({nodes.length} nodes, {edges.length} edges)
-            {nodeCountWarning && (
-              <span className="ml-2 text-amber-400">
-                (showing {MAX_NODES_DISPLAY} of {totalNodes} nodes)
-              </span>
+        <div className="px-4 py-3 border-b border-zinc-700 bg-zinc-900 flex items-center justify-between shrink-0 flex-wrap gap-2">
+          <div className="flex items-center gap-3">
+            <div className="text-xs text-zinc-300">
+              Graph ({nodes.length} nodes, {edges.length} edges)
+              {nodeCountWarning && (
+                <span className="ml-2 text-amber-400">
+                  (showing {MAX_NODES_DISPLAY} of {totalNodes} nodes)
+                </span>
+              )}
+            </div>
+            {unresolvedStats.total > 0 && (
+              <div className="px-2.5 py-0.5 bg-amber-500/10 border border-amber-500/30 rounded text-[11px] text-amber-300 font-mono">
+                Unresolved references: {unresolvedStats.total} (symbolic: {unresolvedStats.symbolic}, system-copybook: {unresolvedStats.systemCopybook}, not-in-snapshot: {unresolvedStats.notInSnapshot})
+              </div>
             )}
           </div>
           <div className="flex items-center gap-2">

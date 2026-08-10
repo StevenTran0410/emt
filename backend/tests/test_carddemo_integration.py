@@ -75,6 +75,14 @@ async def test_carddemo_e2e_code_graph(tmp_path, monkeypatch):
         assert any("CVACT01Y" in t for t in copy_targets)
         assert len(copy_targets) == 4
 
+        # Fact 2b: EXEC SQL INCLUDE members resolve as internal copies edges (not just
+        # ordinary COPY). COTRTLIC includes CSDB2RWY/CSDB2RPY/DCLTRTYP via EXEC SQL
+        # INCLUDE — these must land as edges even though the program also has COPY.
+        cotrtlic_copies = [r["dst_path"] for r in copies_edges if "COTRTLIC" in r["src_path"]]
+        assert any(
+            m in t for t in cotrtlic_copies for m in ("CSDB2RWY", "CSDB2RPY", "DCLTRTYP")
+        ), f"EXEC SQL INCLUDE members missing from COTRTLIC copies edges: {cotrtlic_copies}"
+
         # Fact 3: One executes edge CREASTMT.STEP040 -> CBSTM03A
         async with db.execute(
             "SELECT src_path, dst_path, edge_type FROM structural_graph_edges WHERE snapshot_id=? AND edge_type='executes' AND is_external=0",
@@ -97,7 +105,14 @@ async def test_carddemo_e2e_code_graph(tmp_path, monkeypatch):
         assert any("AWS.M2.CARDDEMO.LOADLIB" in d for d in dataset_nodes)
         assert any("AWS.M2.CARDDEMO.TRXFL.VSAM.KSDS" in d for d in dataset_nodes)
         assert any("AWS.M2.CARDDEMO.CARDXREF.VSAM.KSDS" in d for d in dataset_nodes)
-        assert any("AWS.M2.CARDDEMO.ACCTDATA.VSAM.KSDS" in d for d in dataset_nodes)
+        # Fact 5: Invariant check — zero dangling non-external edges (every non-external dst is in nodes)
+        exp = await graph_service.export_graph_json(snap_id)
+        exp_node_set = set(exp["nodes"])
+        dangling_edges = [
+            e for e in exp["edges"]
+            if not e["external"] and e["dst"] not in exp_node_set
+        ]
+        assert len(dangling_edges) == 0, f"Found dangling non-external edges: {dangling_edges}"
         assert any("AWS.M2.CARDDEMO.CUSTDATA.VSAM.KSDS" in d for d in dataset_nodes)
         assert any("AWS.M2.CARDDEMO.STATEMNT.PS" in d for d in dataset_nodes)
         assert any("AWS.M2.CARDDEMO.STATEMNT.HTML" in d for d in dataset_nodes)

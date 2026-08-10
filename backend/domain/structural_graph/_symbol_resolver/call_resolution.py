@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import logging
 
-from ..symbol_graph import SymbolEdge
 from .._symbol_parser import CallSite, ImportInfo, ParsedFile, SymbolInfo
+from ..symbol_graph import SymbolEdge
 from .constants import _ambiguous_confidence
 from .helpers import (
     _caller_class,

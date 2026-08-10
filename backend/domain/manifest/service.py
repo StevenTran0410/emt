@@ -31,7 +31,7 @@ _LANG_BY_EXT = {
     # Core languages (existing)
     ".py": "python", ".ts": "typescript", ".tsx": "typescript", ".js": "javascript", ".jsx": "javascript",
     ".java": "java", ".go": "go", ".rs": "rust", ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp", ".c": "c", ".h": "c", ".hpp": "cpp",
-    ".cbl": "cobol", ".cob": "cobol", ".cpy": "cobol", ".jcl": "jcl",
+    ".cbl": "cobol", ".cob": "cobol", ".cpy": "cobol", ".dcl": "cobol", ".jcl": "jcl", ".prc": "jcl",
     # New languages
     ".cs": "csharp", ".rb": "ruby", ".php": "php", ".kt": "kotlin", ".kts": "kotlin",
     ".scala": "scala", ".sc": "scala",

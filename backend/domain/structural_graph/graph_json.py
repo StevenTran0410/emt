@@ -65,7 +65,7 @@ def read_graph_json(snapshot_id: str, data_dir: str) -> dict | None:
         return None
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
         logger.warning(f"Failed to read graph.json for snapshot {snapshot_id}: {e}")

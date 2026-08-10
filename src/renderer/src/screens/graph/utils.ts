@@ -30,6 +30,8 @@ export function getNodeStyle(
   impactData?: BlastRadiusResponse | null,
 ): React.CSSProperties {
   let background: string
+  let border = '1px solid rgba(255,255,255,0.2)'
+
   if (isSelected) {
     background = '#fbbf24'
   } else if (impactData) {
@@ -38,6 +40,12 @@ export function getNodeStyle(
     background = hopColor ?? '#52525b'
   } else if (isCycle) {
     background = '#ef4444'
+  } else if (path.startsWith('__unresolved__') || path.includes('__unresolved__')) {
+    background = '#78350f'
+    border = '1px solid #f59e0b'
+  } else if (path.startsWith('__external__') || path.includes('__external__')) {
+    background = '#27272a'
+    border = '1px solid #52525b'
   } else {
     background = communityId >= 0
       ? COMMUNITY_COLORS[communityId % COMMUNITY_COLORS.length]
@@ -52,7 +60,7 @@ export function getNodeStyle(
     fontSize: 10,
     padding: '4px 8px',
     borderRadius: 6,
-    border: isNeighbor ? '2px solid #fbbf24' : '1px solid rgba(255,255,255,0.2)',
+    border: isNeighbor ? '2px solid #fbbf24' : border,
     opacity: dimmed ? 0.35 : 1,
     maxWidth: 160,
     overflow: 'hidden',
@@ -85,15 +93,23 @@ export function buildFlowGraph(
     } as Node
   })
 
-  const edges: Edge[] = data.edges
-    .filter((e) => !e.external)
-    .map((e) => ({
+  const edges: Edge[] = data.edges.map((e) => {
+    const isUnresolved =
+      e.external &&
+      ['unresolved_symbolic', 'system_copybook', 'not_in_snapshot'].includes(e.resolution_class || '')
+
+    const stroke = isUnresolved ? '#f59e0b' : '#71717a'
+    const strokeDasharray = isUnresolved ? '4 4' : undefined
+    const opacity = e.external && !isUnresolved ? 0.35 : 0.75
+
+    return {
       id: `${e.src}->${e.dst}`,
       source: e.src,
       target: e.dst,
-      style: { stroke: '#71717a', strokeWidth: 1.25, opacity: 0.7 },
-      markerEnd: { type: MarkerType.ArrowClosed, color: '#71717a' },
-    }))
+      style: { stroke, strokeWidth: 1.25, strokeDasharray, opacity },
+      markerEnd: { type: MarkerType.ArrowClosed, color: stroke },
+    }
+  })
 
   return { nodes, edges }
 }

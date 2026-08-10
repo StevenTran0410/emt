@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 def _parse_typescript(filename: str, source: str, lang_name: str = "typescript") -> ParsedFile:
     result = ParsedFile(filename=filename, language=lang_name)
     try:
-        from ._ts_loaders import _load_ts_language, _ts_parse, _node_text
+        from ._ts_loaders import _load_ts_language, _node_text, _ts_parse
     except ImportError:
         logger.warning("tree-sitter not available; skipping TS parse for %s", filename)
         return result

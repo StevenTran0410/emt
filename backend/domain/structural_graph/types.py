@@ -35,6 +35,8 @@ class GraphEdge(BaseModel):
     dst_path: str
     edge_type: str
     is_external: bool
+    resolution_class: str | None = None
+    resolution_method: str | None = None
 
 
 class GraphEdgesResponse(BaseModel):

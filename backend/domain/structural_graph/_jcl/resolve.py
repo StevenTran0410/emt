@@ -1,6 +1,4 @@
 """JCL resolution engine for EXEC program execution and DD dataset binding."""
-from __future__ import annotations
-
 import urllib.parse
 from typing import NamedTuple
 
@@ -19,6 +17,17 @@ STANDARD_EXTERNAL_UTILITIES = {
 }
 
 
+def build_proc_index(file_set: set[str]) -> dict[str, list[str]]:
+    """Build map from uppercase proc stem to list of rel_paths (.prc files only)."""
+    proc_map: dict[str, list[str]] = {}
+    for rel_path in file_set:
+        lower = rel_path.lower()
+        if lower.endswith(".prc"):
+            stem = rel_path.rsplit("/", 1)[-1].rsplit(".", 1)[0].upper()
+            proc_map.setdefault(stem, []).append(rel_path)
+    return proc_map
+
+
 class ResolvedJclEdge(NamedTuple):
     src_file: str
     dst_file: str
@@ -35,8 +44,9 @@ def resolve_jcl_execs(
     src_file: str,
     execs: list[JclExecFact],
     program_index: dict[str, list[str]],
+    proc_index: dict[str, list[str]] | None = None,
 ) -> list[ResolvedJclEdge]:
-    """Resolve JCL EXEC PGM= facts into edges."""
+    """Resolve JCL EXEC facts strictly into program or proc execution edges."""
     edges: list[ResolvedJclEdge] = []
 
     for e in execs:
@@ -61,6 +71,58 @@ def resolve_jcl_execs(
             )
             continue
 
+        if getattr(e, "is_proc", False):
+            # Strict PROC resolution — .prc files only
+            proc_matches = proc_index.get(pgm, []) if proc_index else []
+            if len(proc_matches) == 1:
+                dst_file = proc_matches[0]
+                dst_symbol = f"{dst_file}::{pgm}"
+                edges.append(
+                    ResolvedJclEdge(
+                        src_file=src_file,
+                        dst_file=dst_file,
+                        src_symbol=src_symbol,
+                        dst_symbol=dst_symbol,
+                        edge_type="executes",
+                        is_external=False,
+                        confidence_score=1.0,
+                        resolution_method="jcl_exec_proc",
+                        evidence_lines=sorted(e.evidence_lines),
+                    )
+                )
+            elif len(proc_matches) > 1:
+                dst_file = f"__external__/proc/{pgm}"
+                edges.append(
+                    ResolvedJclEdge(
+                        src_file=src_file,
+                        dst_file=dst_file,
+                        src_symbol=src_symbol,
+                        dst_symbol=None,
+                        edge_type="executes",
+                        is_external=True,
+                        confidence_score=0.0,
+                        resolution_method="ambiguous_proc",
+                        evidence_lines=sorted(e.evidence_lines),
+                    )
+                )
+            else:
+                dst_file = f"__external__/proc/{pgm}"
+                edges.append(
+                    ResolvedJclEdge(
+                        src_file=src_file,
+                        dst_file=dst_file,
+                        src_symbol=src_symbol,
+                        dst_symbol=None,
+                        edge_type="executes",
+                        is_external=True,
+                        confidence_score=0.0,
+                        resolution_method="proc_not_in_snapshot",
+                        evidence_lines=sorted(e.evidence_lines),
+                    )
+                )
+            continue
+
+        # Program resolution (PGM=)
         matches = program_index.get(pgm, [])
         if len(matches) == 1:
             dst_file = matches[0]
@@ -159,8 +221,6 @@ def resolve_jcl_dds(
                 )
             )
         else:
-            # Percent-encode any character outside the valid MVS DSN set so the
-            # synthetic node id stays a clean, unambiguous key.
             safe_dsn = urllib.parse.quote(dsn, safe=".@#$-()+")
             dst_file = f"__synthetic__/dataset/{safe_dsn}"
             dst_symbol = f"{dst_file}::DATASET"

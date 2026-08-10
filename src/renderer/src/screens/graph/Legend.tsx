@@ -65,6 +65,14 @@ export function Legend({ communityCount, impactActive }: LegendProps): React.Rea
             <div className="w-2 h-2 rounded-full border border-amber-400 shrink-0" />
             <span className="text-zinc-400">Neighbor</span>
           </div>
+          <div className="flex items-center gap-2">
+            <div className="w-2 h-2 rounded bg-amber-700 border border-amber-500 shrink-0" />
+            <span className="text-zinc-400">Unresolved Ref</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-2 h-2 rounded bg-zinc-800 border border-zinc-600 shrink-0" />
+            <span className="text-zinc-400">External System</span>
+          </div>
         </>
       )}
     </div>
