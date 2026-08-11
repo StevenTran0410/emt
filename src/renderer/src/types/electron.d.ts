@@ -642,6 +642,7 @@ export interface DocGraphClusterSummary {
   node_count: number
   edge_count: number
   mismatch_count: number
+  snapshot_id?: string | null
 }
 
 export interface DocCodeUndocumentedItem {
@@ -757,6 +758,79 @@ export interface AiAssessmentResult {
   generated_at: string
   from_cache: boolean
   stale: boolean
+}
+
+export interface LinkedGraphNode {
+  id: string
+  node_type: string
+  display_name: string
+  in_bd: boolean
+  in_dd: boolean
+  in_code: boolean
+  code_rel_path?: string | null
+  name_fallback_used: boolean
+  entity_verdict: 'matched' | 'undocumented' | 'missing' | 'unknown' | 'out_of_scope'
+  assessed: boolean
+  provenance: any[]
+  attributes?: Record<string, any>
+}
+
+export interface LinkedGraphEdge {
+  edge_key: string
+  src: string
+  dst: string
+  edge_type: string
+  layer: 'doc' | 'doc_code' | 'code'
+  in_bd: boolean
+  in_dd: boolean
+  endpoint_verdict: 'MATCH' | 'DOC_ONLY' | 'CODE_ONLY' | 'UNKNOWN'
+  multiplicity_verdict: 'EXACT_SITE_MATCH' | 'COUNT_ONLY_MATCH' | 'COUNT_MISMATCH' | 'NOT_APPLICABLE' | 'UNKNOWN'
+  doc_count: number
+  code_count: number
+  count_differs: boolean
+  assessed: boolean
+  status: 'asserted' | 'external' | 'unresolved' | 'not_derivable'
+  subject_ok: boolean
+  object_ok: boolean
+  doc_key?: string | null
+  code_key?: string | null
+  confidence: string
+  evidence: any[]
+  symbol_edges: any[]
+}
+
+export interface CrossLinkItem {
+  doc_id: string
+  code_rel_path: string
+  match_method: 'exact_key' | 'name_fallback'
+  candidates: string[]
+  verdict: 'matched' | 'ambiguous' | 'unmatched'
+}
+
+export interface NotAssessedCoverage {
+  entities: { node_type: string; count: number }[]
+  relations: { edge_type: string; exists: number; assessed: number }[]
+}
+
+export interface BdGroupItem {
+  group_id: string
+  bd_doc_id: string
+  section_id?: string | null
+  label: string
+  member_dd_ids: string[]
+  derivation: string
+  evidence: any[]
+}
+
+export interface LinkedGraphResult {
+  cluster_id: string
+  snapshot_id: string
+  eligibility: { authoritative: boolean; reason: string }
+  nodes: LinkedGraphNode[]
+  edges: LinkedGraphEdge[]
+  cross_links: CrossLinkItem[]
+  bd_groups: BdGroupItem[]
+  not_assessed: NotAssessedCoverage
 }
 
 declare global {
@@ -903,6 +977,7 @@ declare global {
         compareRelations: (body: { cluster_id: string; snapshot_id: string }) => Promise<DocCodeRelationCompareResult>
         assess: (body: { cluster_id: string; snapshot_id: string; provider_id?: string }) => Promise<AiAssessmentResult>
         getAssessment: (params: { cluster_id: string; snapshot_id: string }) => Promise<AiAssessmentResult | null>
+        linkedGraph: (params: { cluster_id: string; snapshot_id: string; layers?: string; scope?: string }) => Promise<LinkedGraphResult>
       }
       query: {
         exportCsv: (csv: string, defaultName: string) => Promise<{ saved: boolean; file_path: string | null }>

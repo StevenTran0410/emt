@@ -253,7 +253,7 @@ class _QueryMixin:
         db = get_db()
         async with db.execute(
             """
-            SELECT c.id as cluster_id, c.cluster_name, c.generated_at,
+            SELECT c.id as cluster_id, c.cluster_name, c.generated_at, c.snapshot_id,
                    (SELECT COUNT(*) FROM doc_graph_nodes n WHERE n.cluster_id = c.id)
                        as node_count,
                    (SELECT COUNT(*) FROM doc_graph_edges e WHERE e.cluster_id = c.id)
@@ -274,6 +274,7 @@ class _QueryMixin:
                 node_count=r["node_count"],
                 edge_count=r["edge_count"],
                 mismatch_count=r["mismatch_count"],
+                snapshot_id=r["snapshot_id"],
             )
             for r in rows
         ]

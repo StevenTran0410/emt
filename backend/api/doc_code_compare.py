@@ -10,6 +10,7 @@ from domain.doc_code_compare.types import (
     DocCodeCompareResponse,
     DocCodeRelationCompareRequest,
     DocCodeRelationCompareResponse,
+    LinkedGraphResponse,
 )
 
 router = APIRouter(tags=["doc-code"])
@@ -42,3 +43,18 @@ async def get_doc_code_assessment(
 ) -> AiAssessmentResponse | None:
     """Get the latest persisted AI Assessment for cluster and snapshot."""
     return await _service.get_latest_assessment(cluster_id, snapshot_id)
+
+
+@router.get(
+    "/linked-graph/{cluster_id}/{snapshot_id}", response_model=LinkedGraphResponse
+)
+async def get_linked_graph(
+    cluster_id: str,
+    snapshot_id: str,
+    layers: str = "bd,dd,code",
+    scope: str | None = None,
+) -> LinkedGraphResponse:
+    """Get aggregated linked multi-graph dataset for BD, DD, and Code layers."""
+    return await _service.linked_graph(
+        cluster_id, snapshot_id, layers=layers, scope=scope
+    )

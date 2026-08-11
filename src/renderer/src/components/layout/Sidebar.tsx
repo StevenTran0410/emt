@@ -15,7 +15,8 @@ import {
   Moon,
   Database,
   FileText,
-  CheckCircle2
+  CheckCircle2,
+  Network
 } from 'lucide-react'
 import { useWorkspaceStore } from '../../store/workspace.store'
 import { WorkspaceModal } from '../workspace/WorkspaceModal'
@@ -27,6 +28,7 @@ const NAV_ITEMS = [
   { path: '/repositories', label: 'Repositories', icon: FolderOpen },
   { path: '/doc-parsing', label: 'Document Parsing', icon: FileText },
   { path: '/doc-code-validation', label: 'Doc↔Code Validation', icon: CheckCircle2 },
+  { path: '/linked-graph', label: 'Linked Multi-Graph', icon: Network },
   { path: '/search', label: 'Search', icon: Search },
   { path: '/graph', label: 'Graph', icon: Share2 },
 ]

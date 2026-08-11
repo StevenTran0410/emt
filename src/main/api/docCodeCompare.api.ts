@@ -23,4 +23,15 @@ export function registerDocCodeCompareHandlers(client: BackendClient): void {
     (_e, params: { cluster_id: string; snapshot_id: string }) =>
       client.get(`/api/doc-code/assessment?cluster_id=${params.cluster_id}&snapshot_id=${params.snapshot_id}`)
   )
+
+  ipcMain.handle(
+    'docCode:linkedGraph',
+    (_e, params: { cluster_id: string; snapshot_id: string; layers?: string; scope?: string }) => {
+      const q = new URLSearchParams()
+      if (params.layers) q.set('layers', params.layers)
+      if (params.scope) q.set('scope', params.scope)
+      const queryStr = q.toString() ? `?${q.toString()}` : ''
+      return client.get(`/api/doc-code/linked-graph/${params.cluster_id}/${params.snapshot_id}${queryStr}`)
+    }
+  )
 }

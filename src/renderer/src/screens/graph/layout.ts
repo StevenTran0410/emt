@@ -119,3 +119,65 @@ export function applyForceClusterLayout(nodes: Node[], edges: Edge[]): Node[] {
   const positionById = new Map(forceNodes.map((fn) => [fn.id, { x: fn.x ?? 0, y: fn.y ?? 0 }]))
   return nodes.map((node) => ({ ...node, position: positionById.get(node.id) ?? { x: 0, y: 0 } }))
 }
+
+export interface LaneAlignedLayoutOptions {
+  nodeWidth?: number
+  nodeHeight?: number
+  verticalGap?: number
+}
+
+/**
+ * Lane-aligned multi-graph layout engine (Ticket 1 §6.2).
+ * Lays out anchor layer with rankdir LR Dagre once, then positions secondary layer
+ * aligned horizontally across from matched anchor nodes at laneX, reserving slack for unmatched nodes.
+ */
+export function applyLaneAlignedLayout(
+  anchorNodes: Node[],
+  anchorEdges: Edge[],
+  secondaryNodes: Node[],
+  matchFn: (secNode: Node) => string | null,
+  laneX: number,
+  opts: LaneAlignedLayoutOptions = {}
+): { anchorNodes: Node[]; secondaryNodes: Node[] } {
+  const nodeHeight = opts.nodeHeight ?? 36
+  const verticalGap = opts.verticalGap ?? 20
+
+  const laidOutAnchor = applyDagreLayout(anchorNodes, anchorEdges)
+  const anchorPosMap = new Map<string, { x: number; y: number }>()
+  laidOutAnchor.forEach((n) => anchorPosMap.set(n.id, n.position))
+
+  const unmatchedSecondary: Node[] = []
+  const laidOutSecondary: Node[] = secondaryNodes.map((secNode) => {
+    const anchorId = matchFn(secNode)
+    if (anchorId && anchorPosMap.has(anchorId)) {
+      const anchorPos = anchorPosMap.get(anchorId)!
+      return { ...secNode, position: { x: laneX, y: anchorPos.y } }
+    }
+    unmatchedSecondary.push(secNode)
+    return { ...secNode, position: { x: laneX, y: 0 } }
+  })
+
+  // Position unmatched secondary nodes in vertical gaps
+  if (unmatchedSecondary.length > 0) {
+    let maxY = 0
+    anchorPosMap.forEach((pos) => {
+      if (pos.y > maxY) maxY = pos.y
+    })
+    let curY = maxY + nodeHeight + verticalGap
+    const unmatchedIds = new Set(unmatchedSecondary.map((n) => n.id))
+
+    return {
+      anchorNodes: laidOutAnchor,
+      secondaryNodes: laidOutSecondary.map((secNode) => {
+        if (unmatchedIds.has(secNode.id)) {
+          const pos = { x: laneX, y: curY }
+          curY += nodeHeight + verticalGap
+          return { ...secNode, position: pos }
+        }
+        return secNode
+      })
+    }
+  }
+
+  return { anchorNodes: laidOutAnchor, secondaryNodes: laidOutSecondary }
+}

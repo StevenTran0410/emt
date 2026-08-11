@@ -14,6 +14,7 @@ const IndexOverviewScreen = lazy(() => import('./screens/index-overview'))
 const GraphScreen = lazy(() => import('./screens/graph'))
 const DocParsingScreen = lazy(() => import('./screens/doc-parsing'))
 const DocCodeValidationScreen = lazy(() => import('./screens/doc-code-validation').then(m => ({ default: m.DocCodeValidationScreen })))
+const LinkedGraphScreen = lazy(() => import('./screens/linked-graph').then(m => ({ default: m.LinkedGraphScreen })))
 const SettingsScreen = lazy(() => import('./screens/settings'))
 
 function PageFallback(): React.ReactElement {
@@ -44,6 +45,7 @@ export default function App(): React.ReactElement {
               <Route path="/graph" element={<GraphScreen />} />
               <Route path="/doc-parsing" element={<DocParsingScreen />} />
               <Route path="/doc-code-validation" element={<DocCodeValidationScreen />} />
+              <Route path="/linked-graph/*" element={<LinkedGraphScreen />} />
               <Route path="/settings" element={<SettingsScreen />} />
 
               {/* Legacy / fallback redirects */}

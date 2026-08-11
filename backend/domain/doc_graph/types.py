@@ -39,6 +39,9 @@ class DocGraphClusterSummary(BaseModel):
     node_count: int
     edge_count: int
     mismatch_count: int
+    # The code snapshot this cluster was validated against — pair the linked-graph with THIS,
+    # not an arbitrary snapshot, or the relation comparator returns STALE_INPUT.
+    snapshot_id: str | None = None
 
 
 class DocGraphNode(BaseModel):

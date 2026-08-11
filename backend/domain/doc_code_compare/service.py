@@ -13,10 +13,18 @@ from .relation_adapter import CanonicalCodeRelation, load_canonical_code_relatio
 from .types import (
     AiAssessmentResponse,
     AiConcern,
+    BdGroupItem,
     ComparisonSummary,
+    CrossLinkItem,
     DocCodeCompareResponse,
     DocCodeRelationCompareResponse,
     EligibilityInfo,
+    LinkedGraphEdge,
+    LinkedGraphNode,
+    LinkedGraphResponse,
+    NotAssessedCoverage,
+    NotAssessedEntityCoverage,
+    NotAssessedRelationCoverage,
     PredicateRelationResult,
     RelationComparisonDetail,
     RelationEvidenceItem,
@@ -442,10 +450,10 @@ class DocCodeCompareService:
             ),
         )
 
-    async def compare_relations(
+    async def _compute_relation_compare(
         self, cluster_id: str, snapshot_id: str
     ) -> DocCodeRelationCompareResponse:
-        """Compare structural relationships (calls, copies, runs, binds_dd) between Doc and Code."""
+        """Pure relation comparison calculation without DB mutation."""
         db = get_db()
 
         # 1. Snapshot binding check
@@ -492,7 +500,7 @@ class DocCodeCompareService:
             if r["node_type"] == "job"
         }
 
-        # 3. Fetch doc_graph_assertions (SHOULD-FIX 4: Include doc_id, doc_span, source_span)
+        # 3. Fetch doc_graph_assertions
         async with db.execute(
             """
             SELECT id, side, predicate, subject, object, value,
@@ -579,7 +587,6 @@ class DocCodeCompareService:
             if pred not in pred_results_map:
                 continue
 
-            # BUG 1 FIX: dd -> dataset is NOT_ASSESSED, do NOT compare or emit DOC_ONLY
             if pred == "binds_dd" and subj.startswith("dd/") and obj.startswith("dataset/"):
                 continue
 
@@ -589,7 +596,6 @@ class DocCodeCompareService:
             doc_count = len(doc_items)
             code_count = len(code_items)
 
-            # Resolve subject source file path
             if code_items:
                 sub_rel_path = code_items[0].rel_path
             else:
@@ -599,17 +605,15 @@ class DocCodeCompareService:
                 sub_rel_path is not None and diag_map.get(sub_rel_path) == "ok"
             )
 
-            # BLOCKER 3 FIX: CODE_ONLY is UNKNOWN because doc-side extraction is unverified
             if doc_items and code_items:
                 endpoint_verdict = "MATCH"
             elif doc_items and not code_items:
                 endpoint_verdict = "DOC_ONLY" if is_auth else "UNKNOWN"
             elif code_items and not doc_items:
-                endpoint_verdict = "UNKNOWN"  # Non-authoritative doc extraction
+                endpoint_verdict = "UNKNOWN"
             else:
                 endpoint_verdict = "UNKNOWN"
 
-            # BLOCKER 1 FIX & BUG 3/4 FIX: Site parsing and strict multiplicity/count logic
             multiplicity_verdict = "NOT_APPLICABLE"
             if pred == "calls":
                 doc_lines: list[int] = []
@@ -640,7 +644,6 @@ class DocCodeCompareService:
                 if doc_lines:
                     doc_count = len(doc_lines)
                     if code_lines:
-                        # BLOCKER 1 FIX: Strict site matching (EXACT_SITE_MATCH or COUNT_MISMATCH)
                         if sorted(doc_lines) == sorted(code_lines):
                             multiplicity_verdict = "EXACT_SITE_MATCH"
                         else:
@@ -660,7 +663,6 @@ class DocCodeCompareService:
                     doc_count = len(doc_items)
                     multiplicity_verdict = "NOT_APPLICABLE"
 
-            # Build evidence items (SHOULD-FIX 4: populate doc locator)
             evidence_items: list[RelationEvidenceItem] = []
             for ci in code_items:
                 evidence_items.append(
@@ -715,6 +717,53 @@ class DocCodeCompareService:
             elif endpoint_verdict == "UNKNOWN":
                 total_unknown += 1
 
+        per_predicate_list: list[PredicateRelationResult] = []
+        for p in ["calls", "copies", "runs", "binds_dd"]:
+            details = pred_results_map[p]
+            p_matched = sum(1 for d in details if d.endpoint_verdict == "MATCH")
+            p_doc_only = sum(1 for d in details if d.endpoint_verdict == "DOC_ONLY")
+            p_code_only = sum(1 for d in details if d.endpoint_verdict == "CODE_ONLY")
+            p_unknown = sum(1 for d in details if d.endpoint_verdict == "UNKNOWN")
+
+            per_predicate_list.append(
+                PredicateRelationResult(
+                    predicate=p,
+                    matched=p_matched,
+                    doc_only=p_doc_only,
+                    code_only=p_code_only,
+                    unknown=p_unknown,
+                    details=details,
+                )
+            )
+
+        return DocCodeRelationCompareResponse(
+            cluster_id=cluster_id,
+            snapshot_id=snapshot_id,
+            status=status,
+            per_predicate=per_predicate_list,
+            not_assessed=[
+                "binds_dd(dd->dataset)",
+                "field/PIC",
+                "behavioral(br/tbd/ddlimit)",
+                "access_mode_correctness",
+            ],
+            summary=RelationSummary(
+                matched=total_matched,
+                doc_only=total_doc_only,
+                code_only=total_code_only,
+                unknown=total_unknown,
+            ),
+        )
+
+    async def compare_relations(
+        self, cluster_id: str, snapshot_id: str
+    ) -> DocCodeRelationCompareResponse:
+        """Compare structural relationships (calls, copies, runs, binds_dd) between Doc and Code and persist."""
+        db = get_db()
+        response = await self._compute_relation_compare(cluster_id, snapshot_id)
+        if response.status == "STALE_INPUT":
+            return response
+
         # Purge and persist into DB tables doc_code_relation_comparisons & evidence
         now = datetime.now(UTC).isoformat()
         await db.execute(
@@ -731,16 +780,8 @@ class DocCodeCompareService:
             (cluster_id, snapshot_id),
         )
 
-        per_predicate_list: list[PredicateRelationResult] = []
-        for p in ["calls", "copies", "runs", "binds_dd"]:
-            details = pred_results_map[p]
-            p_matched = sum(1 for d in details if d.endpoint_verdict == "MATCH")
-            p_doc_only = sum(1 for d in details if d.endpoint_verdict == "DOC_ONLY")
-            p_code_only = sum(1 for d in details if d.endpoint_verdict == "CODE_ONLY")
-            p_unknown = sum(1 for d in details if d.endpoint_verdict == "UNKNOWN")
-
-            # Persist to DB
-            for d in details:
+        for pr in response.per_predicate:
+            for d in pr.details:
                 cur = await db.execute(
                     """
                     INSERT INTO doc_code_relation_comparisons (
@@ -756,7 +797,7 @@ class DocCodeCompareService:
                         snapshot_id,
                         d.doc_assertion_id,
                         d.side,
-                        p,
+                        pr.predicate,
                         d.subject_key,
                         d.object_key,
                         d.endpoint_verdict,
@@ -789,37 +830,8 @@ class DocCodeCompareService:
                         ),
                     )
 
-            per_predicate_list.append(
-                PredicateRelationResult(
-                    predicate=p,
-                    matched=p_matched,
-                    doc_only=p_doc_only,
-                    code_only=p_code_only,
-                    unknown=p_unknown,
-                    details=details,
-                )
-            )
-
         await db.commit()
-
-        return DocCodeRelationCompareResponse(
-            cluster_id=cluster_id,
-            snapshot_id=snapshot_id,
-            status=status,
-            per_predicate=per_predicate_list,
-            not_assessed=[
-                "binds_dd(dd->dataset)",
-                "field/PIC",
-                "behavioral(br/tbd/ddlimit)",
-                "access_mode_correctness",
-            ],
-            summary=RelationSummary(
-                matched=total_matched,
-                doc_only=total_doc_only,
-                code_only=total_code_only,
-                unknown=total_unknown,
-            ),
-        )
+        return response
 
     async def assess(
         self, cluster_id: str, snapshot_id: str, provider_id: str | None = None
@@ -972,4 +984,447 @@ class DocCodeCompareService:
             generated_at=row["created_at"],
             from_cache=True,
             stale=stale,
+        )
+
+    async def linked_graph(
+        self,
+        cluster_id: str,
+        snapshot_id: str,
+        layers: str = "bd,dd,code",
+        scope: str | None = None,
+    ) -> LinkedGraphResponse:
+        db = get_db()
+        layer_set = {l.strip().lower() for l in layers.split(",") if l.strip()}
+
+        # 1. Fetch doc graph nodes and edges
+        async with db.execute(
+            """
+            SELECT id, node_type, display_name, attributes, provenance
+            FROM doc_graph_nodes WHERE cluster_id=?
+            """,
+            (cluster_id,),
+        ) as cur:
+            doc_nodes = [dict(r) for r in await cur.fetchall()]
+
+        async with db.execute(
+            """
+            SELECT id, src_node_id, dst_node_id, edge_type, attributes
+            FROM doc_graph_edges WHERE cluster_id=?
+            """,
+            (cluster_id,),
+        ) as cur:
+            doc_edges = [dict(r) for r in await cur.fetchall()]
+
+        # Fetch doc_graph_assertions to map sides, status, confidence
+        async with db.execute(
+            """
+            SELECT id, side, predicate, subject, object, status, confidence, doc_id, doc_span, source_span
+            FROM doc_graph_assertions WHERE cluster_id=?
+            """,
+            (cluster_id,),
+        ) as cur:
+            doc_assertions = [dict(r) for r in await cur.fetchall()]
+
+        # Map doc_id -> doc_kind to derive in_bd / in_dd per node
+        doc_kind_map: dict[str, str] = {}
+        for n in doc_nodes:
+            if n["node_type"] == "doc":
+                attrs = n.get("attributes") or {}
+                if isinstance(attrs, str):
+                    try:
+                        attrs = json.loads(attrs)
+                    except Exception:
+                        attrs = {}
+                doc_kind_map[n["id"]] = attrs.get("doc_kind", "").lower()
+
+        # Build node provenance map & side membership
+        node_side_map: dict[str, set[str]] = {}
+        for n in doc_nodes:
+            nid = n["id"]
+            prov = n.get("provenance") or []
+            if isinstance(prov, str):
+                try:
+                    prov = json.loads(prov)
+                except Exception:
+                    prov = []
+            sides: set[str] = set()
+            for p in prov:
+                if isinstance(p, dict) and "doc_id" in p:
+                    dk = doc_kind_map.get(p["doc_id"], "")
+                    if dk == "bd":
+                        sides.add("bd")
+                    elif dk in ("dd_cobol", "dd_jcl"):
+                        sides.add("dd")
+            node_side_map[nid] = sides
+
+        # Map assertions by (predicate, subject, object) for edge side membership
+        assertion_side_map: dict[tuple[str, str, str], set[str]] = {}
+        assertion_status_map: dict[tuple[str, str, str], str] = {}
+        assertion_conf_map: dict[tuple[str, str, str], str] = {}
+        assertion_evidence_map: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+
+        for a in doc_assertions:
+            key = (a["predicate"], a["subject"], a["object"] or "")
+            side = (a.get("side") or "").lower()
+            assertion_side_map.setdefault(key, set()).add(side)
+            if a.get("status"):
+                assertion_status_map[key] = a["status"]
+            if a.get("confidence"):
+                assertion_conf_map[key] = a["confidence"]
+
+            ev_item = {}
+            if a.get("doc_id"):
+                ev_item["doc_id"] = a["doc_id"]
+            if a.get("doc_span"):
+                ev_item["doc_span"] = a["doc_span"]
+            if a.get("source_span"):
+                ev_item["source_span"] = a["source_span"]
+            if ev_item:
+                assertion_evidence_map.setdefault(key, []).append(ev_item)
+
+        # 2. Fetch code facts & diagnostics
+        async with db.execute(
+            """
+            SELECT fact_type, semantic_key, parent_key, rel_path, line_start, line_end, name, value
+            FROM source_facts WHERE snapshot_id=?
+            """,
+            (snapshot_id,),
+        ) as cur:
+            code_facts = [dict(r) for r in await cur.fetchall()]
+
+        async with db.execute(
+            "SELECT rel_path, status FROM source_parse_diagnostics WHERE snapshot_id=?",
+            (snapshot_id,),
+        ) as cur:
+            diag_rows = [dict(r) for r in await cur.fetchall()]
+        diag_map = {r["rel_path"]: r["status"] for r in diag_rows}
+
+        async with db.execute(
+            "SELECT rel_path FROM manifest_files WHERE snapshot_id=?",
+            (snapshot_id,),
+        ) as cur:
+            mf_rows = [dict(r) for r in await cur.fetchall()]
+
+        # Execute pure comparison cores
+        entity_res = await self.compare(cluster_id, snapshot_id)
+        relation_res = await self._compute_relation_compare(cluster_id, snapshot_id)
+
+        # Build candidate lookup for cross-links (doc_id -> candidate code_rel_paths)
+        code_file_by_name: dict[str, list[str]] = {}
+        for sf in code_facts:
+            name = (sf.get("name") or "").strip().upper()
+            if name:
+                code_file_by_name.setdefault(name, []).append(sf["rel_path"])
+        for mf in mf_rows:
+            rp = mf["rel_path"]
+            bname = rp.rsplit("/", 1)[-1].rsplit(".", 1)[0].upper()
+            if bname:
+                code_file_by_name.setdefault(bname, []).append(rp)
+        # Deduplicate candidate lists
+        code_file_by_name = {k: sorted(list(set(v))) for k, v in code_file_by_name.items()}
+
+        code_fact_by_skey = {sf["semantic_key"]: sf["rel_path"] for sf in code_facts}
+
+        # Build Nodes
+        nodes_out: list[LinkedGraphNode] = []
+        cross_links_out: list[CrossLinkItem] = []
+        assessed_node_types = {"program", "job", "step", "dd", "dataset"}
+
+        for dn in doc_nodes:
+            nid = dn["id"]
+            ntype = dn["node_type"]
+            dname = dn["display_name"]
+            sides = node_side_map.get(nid, set())
+
+            in_bd = "bd" in sides or ("dd" not in sides and len(sides) == 0)
+            in_dd = "dd" in sides
+
+            # Filter layers if requested
+            if "bd" not in layer_set and in_bd and not in_dd:
+                continue
+            if "dd" not in layer_set and in_dd and not in_bd:
+                continue
+
+            # Cross-link resolution
+            exact_path = code_fact_by_skey.get(nid)
+            match_method = "exact_key"
+            candidates: list[str] = []
+            code_rel_path: str | None = None
+            name_fallback_used = False
+
+            if exact_path:
+                code_rel_path = exact_path
+                candidates = [exact_path]
+            else:
+                dname_upper = dname.strip().upper()
+                cands = code_file_by_name.get(dname_upper, [])
+                if cands:
+                    match_method = "name_fallback"
+                    name_fallback_used = True
+                    code_rel_path = cands[0]
+                    candidates = cands
+
+            in_code = code_rel_path is not None
+            entity_verdict = "matched" if in_code else ("missing" if entity_res.eligibility.authoritative else "unknown")
+
+            prov_list = dn.get("provenance") or []
+            if isinstance(prov_list, str):
+                try:
+                    prov_list = json.loads(prov_list)
+                except Exception:
+                    prov_list = []
+
+            attrs = dn.get("attributes") or {}
+            if isinstance(attrs, str):
+                try:
+                    attrs = json.loads(attrs)
+                except Exception:
+                    attrs = {}
+
+            nodes_out.append(
+                LinkedGraphNode(
+                    id=nid,
+                    node_type=ntype,
+                    display_name=dname,
+                    in_bd=in_bd,
+                    in_dd=in_dd,
+                    in_code=in_code,
+                    code_rel_path=code_rel_path,
+                    name_fallback_used=name_fallback_used,
+                    entity_verdict=entity_verdict,
+                    assessed=(ntype in assessed_node_types),
+                    provenance=prov_list,
+                    attributes=attrs if isinstance(attrs, dict) else {},
+                )
+            )
+
+            if code_rel_path:
+                verdict_val = "ambiguous" if len(candidates) > 1 else "matched"
+                cross_links_out.append(
+                    CrossLinkItem(
+                        doc_id=nid,
+                        code_rel_path=code_rel_path,
+                        match_method=match_method,
+                        candidates=candidates,
+                        verdict=verdict_val,
+                    )
+                )
+
+        # Surface code-only entities the docs never mention (undocumented) so a matcher
+        # miss on the code side is visible — only when the code layer is requested.
+        if "code" in layer_set:
+            for tr in entity_res.per_type:
+                for u in tr.undocumented:
+                    nodes_out.append(
+                        LinkedGraphNode(
+                            id=u["key"],
+                            node_type=tr.type,
+                            display_name=u.get("name") or u["key"],
+                            in_bd=False,
+                            in_dd=False,
+                            in_code=True,
+                            code_rel_path=u.get("rel_path"),
+                            name_fallback_used=False,
+                            entity_verdict="undocumented",
+                            assessed=True,
+                            provenance=[],
+                        )
+                    )
+
+        # Build Edges
+        edges_out: list[LinkedGraphEdge] = []
+        detail_map: dict[tuple[str, str, str], RelationComparisonDetail] = {}
+        for pr in relation_res.per_predicate:
+            for d in pr.details:
+                detail_map[(pr.predicate, d.subject_key, d.object_key)] = d
+
+        # Map a projected edge_type back to its assertion predicate (see the projection
+        # in doc_graph/_graph_model.py). Several edge_types share one predicate.
+        etype_to_pred = {
+            "program_calls_program": "calls",
+            "program_copies_copybook": "copies",
+            "job_executes_step": "runs",
+            "step_runs_program": "runs",
+            "step_binds_dd": "binds_dd",
+            "dd_binds_dataset": "binds_dd",
+            "accesses_dataset": "accesses",
+            "cites": "cites",
+            "field_width_relation": "field_width_relation",
+            "references": "references",
+            "rule_about": "rule_about",
+            "defines": "defines",
+        }
+
+        for de in doc_edges:
+            ekey = f"{de['edge_type']}:{de['src_node_id']}->{de['dst_node_id']}"
+            src = de["src_node_id"]
+            dst = de["dst_node_id"]
+            etype = de["edge_type"]
+
+            pred = etype_to_pred.get(etype, etype)
+
+            sides = assertion_side_map.get((pred, src, dst), set())
+            if not sides:
+                # Annotation/linking edges (defines, rule_about, ...) are not backed by a
+                # single-side assertion — inherit layer membership from their endpoints.
+                sides = node_side_map.get(src, set()) | node_side_map.get(dst, set())
+            in_bd = "bd" in sides
+            in_dd = "dd" in sides
+
+            detail = detail_map.get((pred, src, dst))
+            ep_verdict = detail.endpoint_verdict if detail else ("DOC_ONLY" if (in_bd or in_dd) else "UNKNOWN")
+            mult_verdict = detail.multiplicity_verdict if detail else "NOT_APPLICABLE"
+            doc_cnt = detail.doc_count if detail else 1
+            code_cnt = detail.code_count if detail else 0
+            cnt_differs = doc_cnt != code_cnt
+
+            status_val = assertion_status_map.get((pred, src, dst), "asserted")
+            conf_val = assertion_conf_map.get((pred, src, dst), "corroborating")
+            ev_list = assertion_evidence_map.get((pred, src, dst), [])
+
+            src_node = next((n for n in nodes_out if n.id == src), None)
+            dst_node = next((n for n in nodes_out if n.id == dst), None)
+
+            src_file = src_node.code_rel_path if src_node else None
+            dst_file = dst_node.code_rel_path if dst_node else None
+
+            subj_ok = (diag_map.get(src_file) == "ok") if src_file else True
+            obj_ok = (diag_map.get(dst_file) == "ok") if dst_file else True
+
+            doc_k = src if ep_verdict != "MATCH" else None
+            code_k = dst if ep_verdict != "MATCH" else None
+
+            edges_out.append(
+                LinkedGraphEdge(
+                    edge_key=ekey,
+                    src=src,
+                    dst=dst,
+                    edge_type=etype,
+                    layer="doc",
+                    in_bd=in_bd,
+                    in_dd=in_dd,
+                    endpoint_verdict=ep_verdict,
+                    multiplicity_verdict=mult_verdict,
+                    doc_count=doc_cnt,
+                    code_count=code_cnt,
+                    count_differs=cnt_differs,
+                    assessed=detail is not None,
+                    status=status_val,
+                    subject_ok=subj_ok,
+                    object_ok=obj_ok,
+                    doc_key=doc_k,
+                    code_key=code_k,
+                    confidence=conf_val,
+                    evidence=ev_list,
+                    symbol_edges=[],
+                )
+            )
+
+        # Build Not Assessed Coverage Counts
+        unassessed_entity_counts: dict[str, int] = {}
+        for dn in doc_nodes:
+            ntype = dn["node_type"]
+            if ntype not in assessed_node_types:
+                unassessed_entity_counts[ntype] = unassessed_entity_counts.get(ntype, 0) + 1
+
+        not_assessed_entities = [
+            NotAssessedEntityCoverage(node_type=k, count=v) for k, v in sorted(unassessed_entity_counts.items())
+        ]
+
+        unassessed_rel_count = 0
+        for a in doc_assertions:
+            if a["predicate"] == "binds_dd" and (a["subject"] or "").startswith("dd/") and (a["object"] or "").startswith("dataset/"):
+                unassessed_rel_count += 1
+
+        not_assessed_relations = [
+            NotAssessedRelationCoverage(
+                edge_type="dd_binds_dataset",
+                exists=unassessed_rel_count,
+                assessed=0,
+            )
+        ]
+
+        # Build BD groups: group BD-side assertions by (doc_id, section_id). A group's
+        # members are the DD nodes the BD section wraps — so the hull covers real DD flows,
+        # not BD-only entities (Ticket 2 §3).
+        dd_node_ids = {n.id for n in nodes_out if n.in_dd}
+
+        bd_group_map: dict[tuple[str, str], set[str]] = {}
+        bd_group_ev_map: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+        for a in doc_assertions:
+            side = (a.get("side") or "").lower()
+            if side == "bd":
+                doc_id = a.get("doc_id") or "bd_doc"
+                sec_id = "general"
+                doc_span = a.get("doc_span")
+                if isinstance(doc_span, str):
+                    try:
+                        doc_span = json.loads(doc_span)
+                    except Exception:
+                        doc_span = {}
+                if isinstance(doc_span, dict) and doc_span.get("section_id"):
+                    sec_id = str(doc_span["section_id"])
+
+                group_key = (doc_id, sec_id)
+                subj = a.get("subject")
+                obj = a.get("object")
+
+                if subj and subj in dd_node_ids:
+                    bd_group_map.setdefault(group_key, set()).add(subj)
+                if obj and obj in dd_node_ids:
+                    bd_group_map.setdefault(group_key, set()).add(obj)
+
+                ev_entry = {"doc_id": doc_id, "doc_span": doc_span}
+                bd_group_ev_map.setdefault(group_key, []).append(ev_entry)
+
+        if not bd_group_map:
+            for dn in doc_nodes:
+                nid = dn["id"]
+                sides = node_side_map.get(nid, set())
+                if "bd" in sides:
+                    bd_group_map.setdefault(("bd_main", "1.0"), set()).add(nid)
+
+        bd_groups_out: list[BdGroupItem] = []
+        for (doc_id, sec_id), members in bd_group_map.items():
+            if not members:
+                continue
+            gid = f"bd-group:{doc_id}#{sec_id}"
+            lbl = f"BD Section {sec_id}" if sec_id != "general" else f"BD Section ({doc_id})"
+            bd_groups_out.append(
+                BdGroupItem(
+                    group_id=gid,
+                    bd_doc_id=doc_id,
+                    section_id=sec_id,
+                    label=lbl,
+                    member_dd_ids=sorted(list(members)),
+                    derivation="bd_section",
+                    evidence=bd_group_ev_map.get((doc_id, sec_id), []),
+                )
+            )
+
+        # Scope: restrict to the seed node + its 1-hop neighborhood (perf for tickets 2/3).
+        if scope:
+            keep = {scope}
+            for e in edges_out:
+                if e.src == scope:
+                    keep.add(e.dst)
+                if e.dst == scope:
+                    keep.add(e.src)
+            nodes_out = [n for n in nodes_out if n.id in keep]
+            edges_out = [e for e in edges_out if e.src in keep and e.dst in keep]
+            cross_links_out = [c for c in cross_links_out if c.doc_id in keep]
+
+        return LinkedGraphResponse(
+            cluster_id=cluster_id,
+            snapshot_id=snapshot_id,
+            eligibility=entity_res.eligibility,
+            nodes=nodes_out,
+            edges=edges_out,
+            cross_links=cross_links_out,
+            bd_groups=bd_groups_out,
+            not_assessed=NotAssessedCoverage(
+                entities=not_assessed_entities,
+                relations=not_assessed_relations,
+            ),
         )

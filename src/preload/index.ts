@@ -124,7 +124,8 @@ const api = {
     compare: invoke('docCode:compare'),
     compareRelations: invoke('docCode:compareRelations'),
     assess: invoke('docCode:assess'),
-    getAssessment: invoke('docCode:getAssessment')
+    getAssessment: invoke('docCode:getAssessment'),
+    linkedGraph: invoke('docCode:linkedGraph')
   },
   query: {
     exportCsv: invoke('query:exportCsv')
