@@ -1,6 +1,6 @@
-"""JCL resolution engine for EXEC program execution and DD dataset binding."""
+import re
 import urllib.parse
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from .extract import JclDdFact, JclExecFact
 
@@ -238,4 +238,57 @@ def resolve_jcl_dds(
                 )
             )
 
+    return edges
+
+
+def resolve_jcl_stacks(
+    src_file: str,
+    sidecar_facts: list[dict[str, Any]],
+    jcl_index: dict[str, list[str]],
+) -> list[ResolvedJclEdge]:
+    """Resolve JCL STACK facts into structural 'stacks' edges linking to stacked .jcl target."""
+    edges: list[ResolvedJclEdge] = []
+    for fact in sidecar_facts:
+        if fact.get("fact_type") != "stack":
+            continue
+        attrs = fact.get("attributes") or {}
+        member = attrs.get("member")
+        if not member:
+            val = str(fact.get("value") or "")
+            m = re.search(r"\bMEMBER=([A-Za-z0-9#$@]+)", val, re.IGNORECASE)
+            if m:
+                member = m.group(1)
+            elif val and "=" not in val:
+                member = val.strip()
+
+        if not member:
+            continue
+
+        member_stem = member.strip().upper()
+        matches = jcl_index.get(member_stem, [])
+        if len(matches) == 1:
+            dst_file = matches[0]
+            is_external = False
+            confidence = 1.0
+            dst_symbol: str | None = f"{dst_file}::{member_stem}"
+        else:
+            dst_file = f"__external__/jcl/{member_stem}"
+            is_external = True
+            confidence = 0.0
+            dst_symbol = None
+
+        line_no = fact.get("line_start") or 1
+        edges.append(
+            ResolvedJclEdge(
+                src_file=src_file,
+                dst_file=dst_file,
+                src_symbol=f"{src_file}::stack",
+                dst_symbol=dst_symbol,
+                edge_type="stacks",
+                is_external=is_external,
+                confidence_score=confidence,
+                resolution_method="jcl_stack",
+                evidence_lines=[line_no],
+            )
+        )
     return edges

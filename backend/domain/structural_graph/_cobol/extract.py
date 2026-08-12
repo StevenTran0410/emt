@@ -16,7 +16,7 @@ from .generated.Cobol85Parser import Cobol85Parser
 from .generated.Cobol85PreprocessorLexer import Cobol85PreprocessorLexer
 from .generated.Cobol85PreprocessorListener import Cobol85PreprocessorListener
 from .generated.Cobol85PreprocessorParser import Cobol85PreprocessorParser
-from .preprocess import normalize_cobol_text
+from .preprocess import is_copybook_shaped, normalize_cobol_text
 
 
 class CobolCallFact(NamedTuple):
@@ -136,6 +136,35 @@ def _run_main_grammar_pass(
     return listener_m.program_id, listener_m.calls
 
 
+# Bare copybooks (COPY members) have no IDENTIFICATION DIVISION, but Cobol85's
+# startRule requires one and aborts immediately without it ("mismatched input
+# '01' expecting {ID, IDENTIFICATION}"). Wrapping the DATA DIVISION body in this
+# minimal shell lets the same grammar + CobolEnrichmentListener extract
+# record/field facts with no grammar changes. Line numbers must be corrected by
+# _COPYBOOK_WRAP_LINE_COUNT (the number of header lines) after parsing.
+_COPYBOOK_WRAP_HEADER = (
+    "IDENTIFICATION DIVISION.\n"
+    "PROGRAM-ID. COPYBOOK-SHIM.\n"
+    "DATA DIVISION.\n"
+    "WORKING-STORAGE SECTION.\n"
+)
+_COPYBOOK_WRAP_LINE_COUNT = 4
+
+
+def _parse_copybook_tree(norm_no_copy: str, error_listener: ErrorListener) -> Any:
+    """Parse a copybook's normalized body via the synthetic program wrapper."""
+    lexer = Cobol85Lexer(InputStream(_COPYBOOK_WRAP_HEADER + norm_no_copy))
+    lexer.removeErrorListeners()
+    lexer.addErrorListener(error_listener)
+
+    tokens = CommonTokenStream(lexer)
+    parser = Cobol85Parser(tokens)
+    parser.removeErrorListeners()
+    parser.addErrorListener(error_listener)
+    parser._interp.predictionMode = PredictionMode.SLL
+    return parser.startRule()
+
+
 def _extract_exec_sql_includes(norm: str) -> list[CobolCopyFact]:
     """Scan multiline EXEC SQL ... END-EXEC blocks for INCLUDE <member>."""
     results: list[CobolCopyFact] = []
@@ -208,9 +237,13 @@ def extract_cobol_facts(content: str) -> CobolExtractionResult:
                 norm_list[i] = " "
     norm_no_copy = "".join(norm_list)
 
-    # 2. ANTLR Main Pass for PROGRAM-ID and CALL statements.
+    # 2. ANTLR Main Pass for PROGRAM-ID and CALL statements. Skipped for bare
+    # copybooks (no IDENTIFICATION DIVISION) - they have no PROGRAM-ID/CALLs, and
+    # startRule() requires IDENTIFICATION DIVISION so it would just fail on them.
     upper_norm = norm_no_copy.upper()
-    if "IDENTIFICATION" in upper_norm or "PROGRAM-ID" in upper_norm or "CALL" in upper_norm:
+    if not is_copybook_shaped(content) and (
+        "IDENTIFICATION" in upper_norm or "PROGRAM-ID" in upper_norm or "CALL" in upper_norm
+    ):
         try:
             m_program_id, m_calls = _run_main_grammar_pass(norm_no_copy, silent_listener)
             if m_program_id or m_calls:
@@ -627,6 +660,25 @@ class CobolEnrichmentListener(Cobol85Listener):
         )
 
 
+def _walk_copybook_facts(rel_path: str, tree: Any) -> tuple[list[dict[str, Any]], bool, bool]:
+    """Walk a copybook's wrapped parse tree and correct for the synthetic header.
+
+    Drops the synthetic "program" fact from the wrapper's fake PROGRAM-ID (a
+    copybook is never a callable program) and shifts every fact's line numbers
+    back by the wrapper's header-line count so they match the real file.
+    """
+    listener = CobolEnrichmentListener(rel_path)
+    ParseTreeWalker().walk(listener, tree)
+    facts: list[dict[str, Any]] = []
+    for f in listener.facts:
+        if f["fact_type"] == "program":
+            continue
+        f["line_start"] = max(1, f["line_start"] - _COPYBOOK_WRAP_LINE_COUNT)
+        f["line_end"] = max(1, f["line_end"] - _COPYBOOK_WRAP_LINE_COUNT)
+        facts.append(f)
+    return facts, listener.has_exec_sql, listener.has_exec_cics
+
+
 def extract_cobol_enrichment_facts(
     content: str, rel_path: str
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -683,22 +735,26 @@ def extract_cobol_enrichment_facts(
     has_exec_cics = False
 
     try:
-        lexer = Cobol85Lexer(InputStream(norm_no_copy))
-        lexer.removeErrorListeners()
-        lexer.addErrorListener(err_m)
+        if is_copybook_shaped(content):
+            tree = _parse_copybook_tree(norm_no_copy, err_m)
+            facts, has_exec_sql, has_exec_cics = _walk_copybook_facts(rel_path, tree)
+        else:
+            lexer = Cobol85Lexer(InputStream(norm_no_copy))
+            lexer.removeErrorListeners()
+            lexer.addErrorListener(err_m)
 
-        tokens = CommonTokenStream(lexer)
-        parser = Cobol85Parser(tokens)
-        parser.removeErrorListeners()
-        parser.addErrorListener(err_m)
-        parser._interp.predictionMode = PredictionMode.SLL
+            tokens = CommonTokenStream(lexer)
+            parser = Cobol85Parser(tokens)
+            parser.removeErrorListeners()
+            parser.addErrorListener(err_m)
+            parser._interp.predictionMode = PredictionMode.SLL
 
-        tree = parser.startRule()
-        listener = CobolEnrichmentListener(rel_path)
-        ParseTreeWalker().walk(listener, tree)
-        facts = listener.facts
-        has_exec_sql = listener.has_exec_sql
-        has_exec_cics = listener.has_exec_cics
+            tree = parser.startRule()
+            listener = CobolEnrichmentListener(rel_path)
+            ParseTreeWalker().walk(listener, tree)
+            facts = listener.facts
+            has_exec_sql = listener.has_exec_sql
+            has_exec_cics = listener.has_exec_cics
 
         total_err_count = err_p.count + err_m.count
         first_err = err_m.first or err_p.first
@@ -803,30 +859,38 @@ def extract_cobol_all(
     upper_norm = norm_no_copy.upper()
     err_m = _CountingErrorListener()
     try:
-        lexer_m = Cobol85Lexer(InputStream(norm_no_copy))
-        lexer_m.removeErrorListeners()
-        lexer_m.addErrorListener(err_m)
-
-        tokens_m = CommonTokenStream(lexer_m)
-        parser_m = Cobol85Parser(tokens_m)
-        parser_m.removeErrorListeners()
-        parser_m.addErrorListener(err_m)
-        parser_m._interp.predictionMode = PredictionMode.SLL
-
-        tree_m = parser_m.startRule()
-
-        # Single walk: CobolEnrichmentListener extracts PROGRAM-ID, CALL facts, and enrichment facts
-        enrich_listener = CobolEnrichmentListener(rel_path)
-        ParseTreeWalker().walk(enrich_listener, tree_m)
-
-        if enrich_listener.program_id or enrich_listener.calls:
-            program_id = enrich_listener.program_id
-            calls = enrich_listener.calls
+        if is_copybook_shaped(content):
+            # Bare copybook: no IDENTIFICATION DIVISION, so startRule() would abort
+            # immediately (see _parse_copybook_tree). It has no PROGRAM-ID/CALLs -
+            # only its record/field facts matter.
+            tree_m = _parse_copybook_tree(norm_no_copy, err_m)
+            facts, has_exec_sql, has_exec_cics = _walk_copybook_facts(rel_path, tree_m)
             antlr_success = True
+        else:
+            lexer_m = Cobol85Lexer(InputStream(norm_no_copy))
+            lexer_m.removeErrorListeners()
+            lexer_m.addErrorListener(err_m)
 
-        facts = enrich_listener.facts
-        has_exec_sql = enrich_listener.has_exec_sql
-        has_exec_cics = enrich_listener.has_exec_cics
+            tokens_m = CommonTokenStream(lexer_m)
+            parser_m = Cobol85Parser(tokens_m)
+            parser_m.removeErrorListeners()
+            parser_m.addErrorListener(err_m)
+            parser_m._interp.predictionMode = PredictionMode.SLL
+
+            tree_m = parser_m.startRule()
+
+            # Single walk: CobolEnrichmentListener extracts PROGRAM-ID, CALL facts, and enrichment facts
+            enrich_listener = CobolEnrichmentListener(rel_path)
+            ParseTreeWalker().walk(enrich_listener, tree_m)
+
+            if enrich_listener.program_id or enrich_listener.calls:
+                program_id = enrich_listener.program_id
+                calls = enrich_listener.calls
+                antlr_success = True
+
+            facts = enrich_listener.facts
+            has_exec_sql = enrich_listener.has_exec_sql
+            has_exec_cics = enrich_listener.has_exec_cics
 
         total_err_count = err_p.count + err_m.count
         first_err = err_m.first or err_p.first

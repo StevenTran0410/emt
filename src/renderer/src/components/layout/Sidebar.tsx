@@ -16,7 +16,9 @@ import {
   Database,
   FileText,
   CheckCircle2,
-  Network
+  Network,
+  ShieldCheck,
+  Workflow
 } from 'lucide-react'
 import { useWorkspaceStore } from '../../store/workspace.store'
 import { WorkspaceModal } from '../workspace/WorkspaceModal'
@@ -27,6 +29,8 @@ const NAV_ITEMS = [
   { path: '/code-hosts', label: 'Code Hosts', icon: GitBranch },
   { path: '/repositories', label: 'Repositories', icon: FolderOpen },
   { path: '/doc-parsing', label: 'Document Parsing', icon: FileText },
+  { path: '/bd-flow', label: 'BD Flow', icon: Workflow },
+  { path: '/flow-integrity', label: 'Flow Integrity', icon: ShieldCheck },
   { path: '/doc-code-validation', label: 'Doc↔Code Validation', icon: CheckCircle2 },
   { path: '/linked-graph', label: 'Linked Multi-Graph', icon: Network },
   { path: '/search', label: 'Search', icon: Search },

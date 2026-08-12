@@ -52,6 +52,156 @@ export interface AEHTraceDetailResponse {
   spans: AEHTraceSpan[]
 }
 
+export interface BdFlowNode {
+  id: string
+  cluster_id: string
+  doc_id: string
+  node_kind: 'step' | 'decision' | 'event' | 'job_step' | 'asset' | string
+  local_id: string | null
+  binding: string | null
+  binding_type: string | null
+  label: string | null
+  ordinal: number | null
+  guard_text: string | null
+  source_locator: string | null
+  provenance_tier: string
+  doc_line_start: number
+  doc_line_end: number
+  attributes: Record<string, any> | string | null
+  created_at: string
+}
+
+export interface BdFlowEdge {
+  id: string
+  cluster_id: string
+  doc_id: string
+  src_node_id: string
+  dst_node_id: string
+  edge_kind: 'transition' | 'precedes' | 'dependency' | string
+  label: string | null
+  guard_text: string | null
+  provenance_tier: string
+  doc_line: number
+  attributes: Record<string, any> | string | null
+  created_at: string
+}
+
+export interface BdFlowOverlayClaim {
+  id: string
+  cluster_id: string
+  doc_id: string
+  claim_kind: string
+  subject: string
+  relation: string
+  object: string | null
+  modality: string | null
+  tier: 'P1' | 'P2' | 'REJECTED' | string
+  doc_line_start: number
+  doc_line_end: number
+  reject_reasons?: string[]
+  attributes?: Record<string, any> | string | null
+}
+
+/** One SSE frame from POST /api/doc-graph/bd-flow/build-stream (see backend _flow_overlay.py). */
+export interface BdFlowActivityEvent {
+  type: 'chunk_start' | 'thinking' | 'content' | 'chunk_done' | 'done' | 'error'
+  chunk?: string
+  region?: string
+  attempt?: 1 | 2
+  text?: string
+  outcome?: 'ok' | 'empty' | 'transport' | 'nonjson'
+  claims?: number
+  cluster_id?: string
+  node_count?: number
+  edge_count?: number
+  overlay_counts?: { P1: number; P2: number; REJECTED: number } | null
+  message?: string
+}
+
+export interface FlowIntegrityCalibrationSummary {
+  match_percentage: number
+  total_units: number
+  resolved_units: number
+  match_count: number
+  broken_count: number
+  code_only_count: number
+  unknown_count: number
+  calibration_pass: boolean
+  ai_bucket_counts: Record<string, number>
+  banner_message: string
+}
+
+export interface FlowIntegrityFindingRow {
+  id: string
+  bd_span?: string
+  code_fact?: string
+  verdict: string
+  ai_bucket?: string | null
+  rule_violated?: string
+  reason: string
+  rel_path?: string
+  node_kind?: string
+}
+
+export interface FlowIntegrityMapNode {
+  id: string
+  type: string
+  data: {
+    id: string
+    label: string
+    node_kind: string
+    binding?: string | null
+    binding_type?: string | null
+    tag: string
+    ordinal?: number
+    rel_path?: string
+    doc_line_start?: number
+    doc_line_end?: number
+    guard_text?: string | null
+  }
+}
+
+export interface FlowIntegrityMapEdge {
+  id: string
+  source: string
+  target: string
+  label?: string
+  data: {
+    verdict: string
+    guard_verdict?: string | null
+    ai_bucket?: string | null
+    reason: string
+    edge_kind?: string
+    doc_line?: number
+  }
+}
+
+export interface FlowIntegrityMapResponse {
+  cluster_id: string
+  snapshot_id: string
+  nodes: FlowIntegrityMapNode[]
+  edges: FlowIntegrityMapEdge[]
+}
+
+export interface FlowIntegrityFindingsResponse {
+  cluster_id: string
+  snapshot_id: string
+  calibration: FlowIntegrityCalibrationSummary
+  broken_unknown_findings: FlowIntegrityFindingRow[]
+  unknown_findings: FlowIntegrityFindingRow[]
+  code_only_findings: FlowIntegrityFindingRow[]
+  recovery_gaps: FlowIntegrityFindingRow[]
+  collapsed_unknown_count: number
+}
+
+export interface FlowIntegrityExecutiveSummary {
+  overall_verdict: string
+  headline: string
+  key_risks: string[]
+  coverage_note: string
+  recommendation: string
+}
+
 export interface Workspace {
 
   id: string
@@ -625,6 +775,7 @@ export interface DocGraphSummary {
   mismatch_count: number
   mismatches_by_severity: Record<string, number>
   generated_at: string
+  snapshot_id?: string | null
 }
 
 export interface DocGraphExport {
@@ -969,8 +1120,32 @@ declare global {
         pickFiles: () => Promise<string[]>
         stageAndBuild: (body: { files: string[]; snapshot_id?: string | null; force_rebuild?: boolean; llm_enabled?: boolean }) => Promise<DocGraphSummary>
         buildStream: (body: { files: string[]; snapshot_id?: string | null; force_rebuild?: boolean; llm_enabled?: boolean }) => Promise<{ ok: boolean }>
+        bdFlowBuild: (body: { bd_path: string; snapshot_id?: string | null; llm_enabled?: boolean; llm_provider_id?: string | null }) => Promise<{
+          cluster_id: string
+          cluster_name: string
+          node_count: number
+          edge_count: number
+          overlay_counts: { P1: number; P2: number; REJECTED: number } | null
+        }>
+        bdFlowBuildStream: (body: { bd_path: string; snapshot_id?: string | null; llm_enabled?: boolean; llm_provider_id?: string | null }) => Promise<{ ok: boolean }>
+        bdFlowGet: (clusterId: string) => Promise<{
+          nodes: BdFlowNode[]
+          edges: BdFlowEdge[]
+          diagnostics_count: number
+        }>
+        bdFlowOverlayGet: (clusterId: string) => Promise<{
+          claims: BdFlowOverlayClaim[]
+          counts: { P1: number; P2: number; REJECTED: number }
+        }>
+        flowIntegrityGetMap: (clusterId: string, snapshotId: string) => Promise<FlowIntegrityMapResponse>
+        flowIntegrityGetFindings: (clusterId: string, snapshotId: string) => Promise<FlowIntegrityFindingsResponse>
+        flowIntegrityRun: (clusterId: string, snapshotId: string, providerId?: string | null) => Promise<FlowIntegrityFindingsResponse>
+        flowIntegrityGenerateSummary: (clusterId: string, snapshotId: string, providerId?: string | null) => Promise<FlowIntegrityExecutiveSummary>
+        pickBdFile: () => Promise<string | null>
         onStreamEvent: (handler: (evt: any) => void) => void
         offStreamEvent: (handler: (evt: any) => void) => void
+        onBdFlowActivity: (handler: (evt: BdFlowActivityEvent) => void) => void
+        offBdFlowActivity: (handler: (evt: BdFlowActivityEvent) => void) => void
       }
       docCode: {
         compare: (body: { cluster_id: string; snapshot_id: string }) => Promise<DocCodeCompareResult>

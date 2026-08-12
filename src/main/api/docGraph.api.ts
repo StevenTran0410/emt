@@ -107,4 +107,74 @@ export function registerDocGraphHandlers(client: BackendClient): void {
       return { ok: true }
     }
   )
+
+  ipcMain.handle(
+    'docGraph:bdFlowBuild',
+    (_event, body: { bd_path: string; snapshot_id?: string | null; llm_enabled?: boolean; llm_provider_id?: string | null }) =>
+      // LLM overlay makes ~20 sequential-ish provider calls; route over http with a long inactivity
+      // timeout so undici's ~5-min headers cap can't abort the run client-side (same as full build).
+      client.post('/api/doc-graph/bd-flow/build', body, 20 * 60 * 1000)
+  )
+
+  ipcMain.handle(
+    'docGraph:bdFlowBuildStream',
+    async (
+      _e,
+      body: { bd_path: string; snapshot_id?: string | null; llm_enabled?: boolean; llm_provider_id?: string | null }
+    ) => {
+      await client.postStream(
+        '/api/doc-graph/bd-flow/build-stream',
+        body,
+        (evt) => {
+          _e.sender.send('docGraph:bdFlowActivity', evt)
+        }
+      )
+      return { ok: true }
+    }
+  )
+
+  ipcMain.handle('docGraph:bdFlowGet', (_event, clusterId: string) =>
+    client.get(`/api/doc-graph/bd-flow/${clusterId}`)
+  )
+
+  ipcMain.handle('docGraph:bdFlowOverlayGet', (_event, clusterId: string) =>
+    client.get(`/api/doc-graph/bd-flow-overlay/${clusterId}`)
+  )
+
+  ipcMain.handle('docGraph:pickBdFile', async () => {
+    const dialog = await import('electron').then((m) => m.dialog)
+    const r = await dialog.showOpenDialog({
+      properties: ['openFile'],
+      filters: [{ name: 'Markdown BD Report', extensions: ['md'] }]
+    })
+    return r.canceled || r.filePaths.length === 0 ? null : r.filePaths[0]
+  })
+
+  ipcMain.handle('docGraph:flowIntegrityGetMap', (_event, clusterId: string, snapshotId: string) =>
+    client.get(`/api/doc-graph/flow-integrity/${clusterId}/${snapshotId}/map`)
+  )
+
+  ipcMain.handle('docGraph:flowIntegrityGetFindings', (_event, clusterId: string, snapshotId: string) =>
+    client.get(`/api/doc-graph/flow-integrity/${clusterId}/${snapshotId}/findings`)
+  )
+
+  ipcMain.handle(
+    'docGraph:flowIntegrityRun',
+    (_event, clusterId: string, snapshotId: string, providerId?: string | null) =>
+      client.post(
+        `/api/doc-graph/flow-integrity/${clusterId}/${snapshotId}/run`,
+        { provider_id: providerId ?? null },
+        20 * 60 * 1000
+      )
+  )
+
+  ipcMain.handle(
+    'docGraph:flowIntegrityGenerateSummary',
+    (_event, clusterId: string, snapshotId: string, providerId?: string | null) =>
+      client.post(
+        `/api/doc-graph/flow-integrity/${clusterId}/${snapshotId}/summary`,
+        { provider_id: providerId ?? null },
+        20 * 60 * 1000
+      )
+  )
 }

@@ -18,6 +18,21 @@ class BuildDocGraphRequest(BaseModel):
     llm_enabled: bool = True
 
 
+class BuildBdFlowOnlyRequest(BaseModel):
+    bd_path: str
+    snapshot_id: str | None = None
+    llm_enabled: bool = False
+    llm_provider_id: str | None = None
+
+
+class BuildBdFlowOnlyResponse(BaseModel):
+    cluster_id: str
+    cluster_name: str
+    node_count: int
+    edge_count: int
+    overlay_counts: dict[str, int] | None = None
+
+
 class DocGraphSummary(BaseModel):
     cluster_id: str
     cluster_name: str
@@ -30,6 +45,7 @@ class DocGraphSummary(BaseModel):
     mismatch_count: int
     mismatches_by_severity: dict[str, int]
     generated_at: str
+    snapshot_id: str | None = None
 
 
 class DocGraphClusterSummary(BaseModel):
@@ -116,6 +132,12 @@ class SectionMapInfo:
 
 
 @dataclass
+class MermaidBlock:
+    text: str
+    fence_line: int  # 1-based line of the ```mermaid fence line
+
+
+@dataclass
 class ParsedDoc:
     id: str
     doc_kind: str  # 'bd' | 'dd_cobol' | 'dd_jcl'
@@ -126,7 +148,7 @@ class ParsedDoc:
     section_map: SectionMapInfo = field(default_factory=SectionMapInfo)
     tables: list[dict[str, Any]] = field(default_factory=list)
     labeled_ids: list[dict[str, Any]] = field(default_factory=list)
-    mermaid_diagrams: list[str] = field(default_factory=list)
+    mermaid_diagrams: list[MermaidBlock] = field(default_factory=list)
     raw_content: str = ""
     warnings: list[str] = field(default_factory=list)  # §7.7: recorded, never a hard-fail
 

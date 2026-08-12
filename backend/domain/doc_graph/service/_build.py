@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -13,17 +14,76 @@ from infrastructure.db.database import get_db
 from shared.logger import logger
 from shared.utils import utc_now_iso
 
+from .._flow_extract import extract_bd_flow
+from .._flow_overlay import run_bd_flow_overlay
 from .._graph_model import build_assertions_and_projection
 from .._llm_citation import run_llm_citation_tier, run_llm_citation_tier_stream
 from .._markdown_parser import parse_markdown_report
 from .._mismatch import detect_mismatches
 from ..types import (
     PARSER_VERSION,
+    BuildBdFlowOnlyRequest,
+    BuildBdFlowOnlyResponse,
     BuildDocGraphRequest,
     DocGraphMismatch,
     DocGraphSummary,
     ParsedDoc,
 )
+
+
+async def _save_bd_flow(db: Any, parsed_docs: list[ParsedDoc], cluster_id: str) -> None:
+    """Extract and persist BD flow skeleton for all BD docs in cluster."""
+    # Delete once for the whole cluster, not per doc — a second BD doc must not wipe the first's rows.
+    await db.execute("DELETE FROM bd_flow_nodes WHERE cluster_id=?", (cluster_id,))
+    await db.execute("DELETE FROM bd_flow_edges WHERE cluster_id=?", (cluster_id,))
+    for doc in parsed_docs:
+        if doc.doc_kind == "bd":
+            try:
+                flow_res = extract_bd_flow(doc, doc.id, cluster_id)
+
+                if flow_res.nodes:
+                    node_rows = [
+                        (
+                            n["id"], n["cluster_id"], n["doc_id"], n["node_kind"],
+                            n["local_id"], n["binding"], n["binding_type"], n["label"],
+                            n["ordinal"], n["guard_text"], n["source_locator"],
+                            n["provenance_tier"], n["doc_line_start"], n["doc_line_end"],
+                            n["attributes"], n["created_at"],
+                        )
+                        for n in flow_res.nodes
+                    ]
+                    await db.executemany(
+                        """
+                        INSERT INTO bd_flow_nodes
+                        (id, cluster_id, doc_id, node_kind, local_id, binding, binding_type,
+                         label, ordinal, guard_text, source_locator, provenance_tier,
+                         doc_line_start, doc_line_end, attributes, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        node_rows,
+                    )
+
+                if flow_res.edges:
+                    edge_rows = [
+                        (
+                            e["id"], e["cluster_id"], e["doc_id"], e["src_node_id"],
+                            e["dst_node_id"], e["edge_kind"], e["label"], e["guard_text"],
+                            e["provenance_tier"], e["doc_line"], e["attributes"], e["created_at"],
+                        )
+                        for e in flow_res.edges
+                    ]
+                    await db.executemany(
+                        """
+                        INSERT INTO bd_flow_edges
+                        (id, cluster_id, doc_id, src_node_id, dst_node_id, edge_kind,
+                         label, guard_text, provenance_tier, doc_line, attributes, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        edge_rows,
+                    )
+                await db.commit()
+            except Exception as exc:
+                logger.warning("[doc_graph] BD flow extraction failed for doc %s: %s", doc.id, exc)
 
 
 def _canonicalize_dir_path(raw_path: str) -> str:
@@ -44,7 +104,7 @@ class _BuildMixin:
 
     def _prepare_source_files(
         self, source_dir_raw: str
-    ) -> tuple[str, Path, list[Path], list[tuple[Path, str, str]], str]:
+    ) -> tuple[str, Path, list[Path], list[tuple[Path, str, str]], str, str]:
         source_dir = _canonicalize_dir_path(source_dir_raw)
         src_path = Path(source_dir)
 
@@ -114,6 +174,254 @@ class _BuildMixin:
                 raise ValueError(
                     f"Invalid snapshot_id: '{snapshot_id}' does not exist in repo_snapshots"
                 )
+
+    async def build_bd_flow_only(
+        self, req: BuildBdFlowOnlyRequest
+    ) -> BuildBdFlowOnlyResponse:
+        """Parse BD file only and extract BD flow graph skeleton without requiring DD files or running legacy assertion pipeline."""
+        p = Path(req.bd_path).resolve()
+        if not p.exists() or not p.is_file():
+            raise ValueError(f"BD file does not exist: {req.bd_path}")
+        if p.suffix.lower() != ".md":
+            raise ValueError(f"BD file must be a markdown file (.md): {req.bd_path}")
+        if "BD" not in p.name.upper():
+            raise ValueError(f"File does not appear to be a BD document (filename must contain 'BD'): {p.name}")
+
+        content = p.read_text(encoding="utf-8")
+        c_sha = _hash_string(content)
+        parsed_doc = parse_markdown_report(str(p), content, c_sha)
+
+        source_dir = _canonicalize_dir_path(str(p.parent))
+
+        # Derive cluster_name using same logic as full build
+        cluster_name = p.stem
+        for line in content.splitlines():
+            if line.startswith("# Basic Design —"):
+                raw_name = line.replace("# Basic Design —", "").strip()
+                cluster_name = re.sub(r"\s+cluster$", "", raw_name, flags=re.IGNORECASE).strip()
+                break
+            elif line.startswith("# Basic Design"):
+                raw_name = line.replace("# Basic Design", "").strip()
+                cluster_name = (
+                    re.sub(r"\s+cluster$", "", raw_name, flags=re.IGNORECASE).strip()
+                    or cluster_name
+                )
+                break
+
+        cluster_id = _hash_string(f"{source_dir}:{cluster_name}")
+        now = utc_now_iso()
+        db = get_db()
+
+        if req.snapshot_id:
+            await self._validate_snapshot_binding(db, req.snapshot_id)
+
+        # Upsert cluster row safely: do NOT delete existing row (prevents cascade wipe of docs/assertions)
+        async with db.execute(
+            "SELECT id FROM doc_graph_clusters WHERE id=?", (cluster_id,)
+        ) as cur:
+            row = await cur.fetchone()
+
+        if not row:
+            await db.execute(
+                """
+                INSERT INTO doc_graph_clusters
+                (id, cluster_name, source_dir, bd_path, snapshot_id, input_fingerprint,
+                 parser_version, status, generated_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
+                """,
+                (
+                    cluster_id,
+                    cluster_name,
+                    source_dir,
+                    str(p).replace("\\", "/"),
+                    req.snapshot_id,
+                    c_sha,
+                    PARSER_VERSION,
+                    now,
+                    now,
+                ),
+            )
+            await db.commit()
+        elif req.snapshot_id:
+            # Existing cluster: (re)bind to the provided snapshot. UPDATE is cascade-safe (no delete).
+            await db.execute(
+                "UPDATE doc_graph_clusters SET snapshot_id=? WHERE id=?",
+                (req.snapshot_id, cluster_id),
+            )
+            await db.commit()
+
+        # Extract and persist BD flow rows
+        await _save_bd_flow(db, [parsed_doc], cluster_id)
+
+        # Count extracted flow nodes and edges
+        async with db.execute(
+            "SELECT COUNT(*) as cnt FROM bd_flow_nodes WHERE cluster_id=?", (cluster_id,)
+        ) as cur:
+            node_cnt = (await cur.fetchone())["cnt"]
+        async with db.execute(
+            "SELECT COUNT(*) as cnt FROM bd_flow_edges WHERE cluster_id=?", (cluster_id,)
+        ) as cur:
+            edge_cnt = (await cur.fetchone())["cnt"]
+
+        # Run optional LLM overlay phase if enabled
+        overlay_counts = None
+        if req.llm_enabled:
+            try:
+                await run_bd_flow_overlay(db, [parsed_doc], cluster_id, req.llm_provider_id)
+                # The runner returns nothing — read the tier counts back from the claims table.
+                overlay_counts = {"P1": 0, "P2": 0, "REJECTED": 0}
+                async with db.execute(
+                    "SELECT tier, COUNT(*) as cnt FROM bd_flow_overlay_claims WHERE cluster_id=? GROUP BY tier",
+                    (cluster_id,),
+                ) as cur:
+                    for r in await cur.fetchall():
+                        overlay_counts[r["tier"]] = r["cnt"]
+            except Exception as exc:
+                logger.warning("[doc_graph] BD flow overlay execution failed: %s", exc)
+
+        return BuildBdFlowOnlyResponse(
+            cluster_id=cluster_id,
+            cluster_name=cluster_name,
+            node_count=node_cnt,
+            edge_count=edge_cnt,
+            overlay_counts=overlay_counts,
+        )
+
+    async def build_bd_flow_only_stream(
+        self, req: BuildBdFlowOnlyRequest
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Same skeleton build as build_bd_flow_only, but streams the overlay's per-chunk LLM
+        activity (thinking/content deltas + outcome) as SSE events instead of only returning final
+        counts. Skeleton (deterministic) phase is never streamed — only the overlay phase is."""
+        try:
+            p = Path(req.bd_path).resolve()
+            if not p.exists() or not p.is_file():
+                raise ValueError(f"BD file does not exist: {req.bd_path}")
+            if p.suffix.lower() != ".md":
+                raise ValueError(f"BD file must be a markdown file (.md): {req.bd_path}")
+            if "BD" not in p.name.upper():
+                raise ValueError(
+                    f"File does not appear to be a BD document (filename must contain 'BD'): {p.name}"
+                )
+
+            content = p.read_text(encoding="utf-8")
+            c_sha = _hash_string(content)
+            parsed_doc = parse_markdown_report(str(p), content, c_sha)
+
+            source_dir = _canonicalize_dir_path(str(p.parent))
+
+            # Derive cluster_name using same logic as build_bd_flow_only
+            cluster_name = p.stem
+            for line in content.splitlines():
+                if line.startswith("# Basic Design —"):
+                    raw_name = line.replace("# Basic Design —", "").strip()
+                    cluster_name = re.sub(r"\s+cluster$", "", raw_name, flags=re.IGNORECASE).strip()
+                    break
+                elif line.startswith("# Basic Design"):
+                    raw_name = line.replace("# Basic Design", "").strip()
+                    cluster_name = (
+                        re.sub(r"\s+cluster$", "", raw_name, flags=re.IGNORECASE).strip()
+                        or cluster_name
+                    )
+                    break
+
+            cluster_id = _hash_string(f"{source_dir}:{cluster_name}")
+            now = utc_now_iso()
+            db = get_db()
+
+            if req.snapshot_id:
+                await self._validate_snapshot_binding(db, req.snapshot_id)
+
+            async with db.execute(
+                "SELECT id FROM doc_graph_clusters WHERE id=?", (cluster_id,)
+            ) as cur:
+                row = await cur.fetchone()
+
+            if not row:
+                await db.execute(
+                    """
+                    INSERT INTO doc_graph_clusters
+                    (id, cluster_name, source_dir, bd_path, snapshot_id, input_fingerprint,
+                     parser_version, status, generated_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?)
+                    """,
+                    (
+                        cluster_id,
+                        cluster_name,
+                        source_dir,
+                        str(p).replace("\\", "/"),
+                        req.snapshot_id,
+                        c_sha,
+                        PARSER_VERSION,
+                        now,
+                        now,
+                    ),
+                )
+                await db.commit()
+            elif req.snapshot_id:
+                # Existing cluster: (re)bind to the provided snapshot. UPDATE is cascade-safe (no delete).
+                await db.execute(
+                    "UPDATE doc_graph_clusters SET snapshot_id=? WHERE id=?",
+                    (req.snapshot_id, cluster_id),
+                )
+                await db.commit()
+
+            await _save_bd_flow(db, [parsed_doc], cluster_id)
+
+            async with db.execute(
+                "SELECT COUNT(*) as cnt FROM bd_flow_nodes WHERE cluster_id=?", (cluster_id,)
+            ) as cur:
+                node_cnt = (await cur.fetchone())["cnt"]
+            async with db.execute(
+                "SELECT COUNT(*) as cnt FROM bd_flow_edges WHERE cluster_id=?", (cluster_id,)
+            ) as cur:
+                edge_cnt = (await cur.fetchone())["cnt"]
+
+            overlay_counts = None
+            if req.llm_enabled:
+                queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+                sentinel = object()
+
+                async def on_event(ev: dict[str, Any]) -> None:
+                    await queue.put(ev)
+
+                async def _run_overlay() -> None:
+                    try:
+                        await run_bd_flow_overlay(
+                            db, [parsed_doc], cluster_id, req.llm_provider_id, on_event=on_event
+                        )
+                    except Exception as exc:
+                        # Overlay is best-effort — a stream failure must not break the skeleton build.
+                        logger.warning("[doc_graph] BD flow overlay stream failed: %s", exc)
+                    finally:
+                        await queue.put(sentinel)
+
+                producer = asyncio.create_task(_run_overlay())
+                while True:
+                    item = await queue.get()
+                    if item is sentinel:
+                        break
+                    yield item
+                await producer
+
+                overlay_counts = {"P1": 0, "P2": 0, "REJECTED": 0}
+                async with db.execute(
+                    "SELECT tier, COUNT(*) as cnt FROM bd_flow_overlay_claims WHERE cluster_id=? GROUP BY tier",
+                    (cluster_id,),
+                ) as cur:
+                    for r in await cur.fetchall():
+                        overlay_counts[r["tier"]] = r["cnt"]
+
+            yield {
+                "type": "done",
+                "cluster_id": cluster_id,
+                "node_count": node_cnt,
+                "edge_count": edge_cnt,
+                "overlay_counts": overlay_counts,
+            }
+        except Exception as e:
+            logger.error(f"[doc_graph] Error in build_bd_flow_only_stream: {e}")
+            yield {"type": "error", "message": str(e)}
 
     async def build(self, req: BuildDocGraphRequest) -> DocGraphSummary:
         """Build doc graph cluster (non-streaming, synchronous result)."""
@@ -322,6 +630,15 @@ class _BuildMixin:
             )
 
             await db.commit()
+            await _save_bd_flow(db, parsed_docs, cluster_id)
+            if req.llm_enabled:
+                try:
+                    await run_bd_flow_overlay(db, parsed_docs, cluster_id, req.llm_provider_id)
+                except Exception as exc:
+                    # Overlay is best-effort — the deterministic build must never fail because of it.
+                    logger.warning(
+                        "[doc_graph] BD flow prose overlay failed for cluster %s: %s", cluster_id, exc
+                    )
             logger.info(
                 "[doc_graph] Cluster %s built: %d docs, %d assertions, %d nodes, %d edges, "
                 "%d mismatches (%d deterministic, %d llm)",
@@ -554,6 +871,17 @@ class _BuildMixin:
                 )
 
                 await db.commit()
+                await _save_bd_flow(db, parsed_docs, cluster_id)
+                if req.llm_enabled:
+                    try:
+                        await run_bd_flow_overlay(db, parsed_docs, cluster_id, req.llm_provider_id)
+                    except Exception as exc:
+                        # Overlay is best-effort — the deterministic build must never fail because of it.
+                        logger.warning(
+                            "[doc_graph] BD flow prose overlay failed for cluster %s: %s",
+                            cluster_id,
+                            exc,
+                        )
             except Exception:
                 await db.rollback()
                 raise

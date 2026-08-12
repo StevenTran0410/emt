@@ -97,6 +97,7 @@ class _QueryMixin:
             mismatch_count=total_mismatches,
             mismatches_by_severity=mismatches_by_sev,
             generated_at=cluster_row["generated_at"] or "",
+            snapshot_id=cluster_row["snapshot_id"],
         )
 
     async def nodes(
@@ -284,3 +285,72 @@ class _QueryMixin:
         db = get_db()
         await db.execute("DELETE FROM doc_graph_clusters WHERE id=?", (cluster_id,))
         await db.commit()
+
+    async def bd_flow(self, cluster_id: str) -> dict[str, Any]:
+        """Return BD flow nodes, edges, and diagnostics count for a cluster."""
+        await self._ensure_cluster_exists(cluster_id)
+        db = get_db()
+        async with db.execute(
+            "SELECT * FROM bd_flow_nodes WHERE cluster_id=?", (cluster_id,)
+        ) as cur:
+            node_rows = await cur.fetchall()
+
+        async with db.execute(
+            "SELECT * FROM bd_flow_edges WHERE cluster_id=?", (cluster_id,)
+        ) as cur:
+            edge_rows = await cur.fetchall()
+
+        nodes = []
+        for r in node_rows:
+            d = dict(r)
+            if d.get("attributes"):
+                try:
+                    d["attributes"] = json.loads(d["attributes"])
+                except Exception:
+                    pass
+            nodes.append(d)
+
+        edges = []
+        for r in edge_rows:
+            d = dict(r)
+            if d.get("attributes"):
+                try:
+                    d["attributes"] = json.loads(d["attributes"])
+                except Exception:
+                    pass
+            edges.append(d)
+
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "diagnostics_count": 0,
+        }
+
+    async def bd_flow_overlay(self, cluster_id: str) -> dict[str, Any]:
+        """Return BD flow LLM prose overlay candidate claims and tier counts for a cluster."""
+        await self._ensure_cluster_exists(cluster_id)
+        db = get_db()
+        async with db.execute(
+            "SELECT * FROM bd_flow_overlay_claims WHERE cluster_id=? ORDER BY tier, id",
+            (cluster_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        json_fields = (
+            "subject_json", "object_json", "guard_json", "citation_json",
+            "reject_reasons", "raw_llm_json",
+        )
+        counts = {"P1": 0, "P2": 0, "REJECTED": 0}
+        claims: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            for f in json_fields:
+                if d.get(f):
+                    try:
+                        d[f] = json.loads(d[f])
+                    except Exception:
+                        pass
+            counts[d["tier"]] = counts.get(d["tier"], 0) + 1
+            claims.append(d)
+
+        return {"claims": claims, "counts": counts}

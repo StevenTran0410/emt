@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .types import ParsedDoc, SectionMapInfo
+from .types import MermaidBlock, ParsedDoc, SectionMapInfo
 
 _HEADING_REGEX = re.compile(r"^(#{1,4})\s+(?:(\d+(?:\.\d+)*)\.?\s+)?(.+?)\s*$")
 _TABLE_ROW_REGEX = re.compile(r"^\s*\|(.+)\|\s*$")
@@ -65,7 +65,7 @@ def parse_markdown_report(file_path: str, content: str, content_sha256: str) -> 
     steps: list[dict[str, Any]] = []
     tables: list[dict[str, Any]] = []
     labeled_ids: list[dict[str, Any]] = []
-    mermaid_diagrams: list[str] = []
+    mermaid_diagrams: list[MermaidBlock] = []
 
     current_section_id = "root"
     current_section_title = "Root"
@@ -76,6 +76,7 @@ def parse_markdown_report(file_path: str, content: str, content_sha256: str) -> 
 
     in_mermaid = False
     current_mermaid_lines: list[str] = []
+    current_mermaid_fence_line = 0
 
     # N3: Extract labeled IDs across all lines with scoping and deduplication
     seen_labeled_keys: set[str] = set()
@@ -134,6 +135,7 @@ def parse_markdown_report(file_path: str, content: str, content_sha256: str) -> 
         if line.strip().startswith("```mermaid"):
             in_mermaid = True
             current_mermaid_lines = []
+            current_mermaid_fence_line = i + 1
             if headings:
                 headings[-1]["payload_kind"] = "mermaid"
             i += 1
@@ -142,7 +144,12 @@ def parse_markdown_report(file_path: str, content: str, content_sha256: str) -> 
         if in_mermaid:
             if line.strip().startswith("```"):
                 in_mermaid = False
-                mermaid_diagrams.append("\n".join(current_mermaid_lines))
+                mermaid_diagrams.append(
+                    MermaidBlock(
+                        text="\n".join(current_mermaid_lines),
+                        fence_line=current_mermaid_fence_line,
+                    )
+                )
             else:
                 current_mermaid_lines.append(line)
             i += 1

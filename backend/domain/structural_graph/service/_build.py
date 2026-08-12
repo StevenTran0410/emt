@@ -87,6 +87,15 @@ class _BuildMixin:
 
         py_suffix_index = _build_py_suffix_index(file_set)
 
+        # ISPF/TSO filename indices (basename-stem lookup, independent of the
+        # PROGRAM-ID-based cobol_program_index below - see _ispf/resolve.py).
+        from .._ispf import build_ext_index as _build_ispf_ext_index
+
+        ispf_clist_index = _build_ispf_ext_index(file_set, ".clist")
+        ispf_jcl_index = _build_ispf_ext_index(file_set, ".jcl")
+        ispf_cbl_index = _build_ispf_ext_index(file_set, ".cbl")
+        ispf_ipf_index = _build_ispf_ext_index(file_set, ".ipf")
+
         # ──── Part A: Extraction Cache ────────────────────────────────────────
         from ..extraction_cache import (
             _get_previous_snapshot_id,
@@ -149,22 +158,29 @@ class _BuildMixin:
         cobol_facts_cache: dict[str, Any] = {}
         cobol_enrich_cache: dict[str, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
         proc_index: dict[str, list[str]] = {}
+        # Cache Fujitsu-dialect normalization per file: computed once, reused by
+        # both the structural-edge extractor and the ANTLR enrichment extractor.
+        fujitsu_normalize_cache: dict[str, Any] = {}
         if _COBOL_JCL_GRAPH_ENABLED:
             from .._cobol import (
                 build_copybook_index,
                 build_program_index,
                 extract_cobol_all,
                 extract_cobol_facts,
+                is_copybook_shaped,
             )
             from .._jcl import build_proc_index
 
             extracted_program_ids: dict[str, str | None] = {}
+            copybook_shaped_paths: set[str] = set()
             for r in files:
                 if r["language"] == "cobol" and r["category"] in {"source", "infra"}:
                     src_f = (root / r["rel_path"]).resolve()
                     if src_f.exists() and src_f.is_file():
                         c_content = read_utf8_lenient(src_f)
                         if c_content:
+                            if is_copybook_shaped(c_content):
+                                copybook_shaped_paths.add(r["rel_path"])
                             if _CODEGRAPH_ENRICH_ENABLED:
                                 res, enrich_facts, diag = extract_cobol_all(
                                     c_content, r["rel_path"]
@@ -176,7 +192,7 @@ class _BuildMixin:
                             cobol_facts_cache[r["rel_path"]] = res
 
             cobol_program_index = build_program_index(extracted_program_ids)
-            copybook_index = build_copybook_index(file_set)
+            copybook_index = build_copybook_index(file_set, copybook_shaped_paths)
             proc_index = build_proc_index(file_set)
 
         for r in files_to_process:
@@ -210,13 +226,17 @@ class _BuildMixin:
                 imports = _extract_ts_js_imports(content)
             elif _COBOL_JCL_GRAPH_ENABLED and language == "cobol":
                 from .._cobol import extract_cobol_facts, resolve_cobol_calls, resolve_cobol_copies
+                from .._ispf import resolve_cobol_panel_refs
                 from .._legacy_edges import convert_resolved_edges_to_rows
 
                 res = cobol_facts_cache.get(rel_path) or extract_cobol_facts(content)
                 c_calls = resolve_cobol_calls(rel_path, res.program_id, [c._asdict() for c in res.calls], cobol_program_index)
                 c_copies = resolve_cobol_copies(rel_path, res.program_id, [c._asdict() for c in res.copies], copybook_index)
+                # Deterministic program->panel link: the .ipf basename appears as a
+                # quoted literal in the COBOL source (e.g. VALUE 'FHNIXLOT').
+                c_panels = resolve_cobol_panel_refs(rel_path, content, ispf_ipf_index)
 
-                c_rows = convert_resolved_edges_to_rows(req.snapshot_id, c_calls + c_copies, now)
+                c_rows = convert_resolved_edges_to_rows(req.snapshot_id, c_calls + c_copies + c_panels, now)
                 edge_inputs.extend(c_rows.file_edge_inputs)
                 _edge_rows.extend(c_rows.file_edge_rows)
                 _symbol_edge_rows.extend(c_rows.symbol_edge_rows)
@@ -224,19 +244,61 @@ class _BuildMixin:
                 external_edges += sum(1 for inp in c_rows.file_edge_inputs if inp[3] == 1)
                 continue
             elif _COBOL_JCL_GRAPH_ENABLED and language == "jcl":
-                from .._jcl import extract_jcl_facts, resolve_jcl_dds, resolve_jcl_execs
+                from .._jcl import extract_jcl_facts, resolve_jcl_dds, resolve_jcl_execs, resolve_jcl_stacks
+                from .._jcl.fujitsu_normalize import is_fujitsu_jcl
+                from .._jcl.fujitsu_normalize import normalize as normalize_fujitsu_jcl
                 from .._legacy_edges import convert_resolved_edges_to_rows
 
-                j_res = extract_jcl_facts(content)
+                jcl_content = content
+                sidecar_facts = []
+                if is_fujitsu_jcl(content):
+                    if rel_path not in fujitsu_normalize_cache:
+                        fujitsu_normalize_cache[rel_path] = normalize_fujitsu_jcl(content)
+                    f_res = fujitsu_normalize_cache[rel_path]
+                    jcl_content = f_res.normalized_text
+                    sidecar_facts = f_res.sidecar_facts
+
+                j_res = extract_jcl_facts(jcl_content)
                 j_execs = resolve_jcl_execs(rel_path, j_res.execs, cobol_program_index, proc_index)
                 j_dds = resolve_jcl_dds(rel_path, j_res.dds)
+                j_stacks = resolve_jcl_stacks(rel_path, sidecar_facts, ispf_jcl_index)
 
-                j_rows = convert_resolved_edges_to_rows(req.snapshot_id, j_execs + j_dds, now)
+                j_rows = convert_resolved_edges_to_rows(req.snapshot_id, j_execs + j_dds + j_stacks, now)
                 edge_inputs.extend(j_rows.file_edge_inputs)
                 _edge_rows.extend(j_rows.file_edge_rows)
                 _symbol_edge_rows.extend(j_rows.symbol_edge_rows)
                 total_edges += len(j_rows.file_edge_inputs)
                 external_edges += sum(1 for inp in j_rows.file_edge_inputs if inp[3] == 1)
+                continue
+            elif language == "pfd":
+                from .._ispf import extract_pfd_facts, resolve_menu_options
+                from .._legacy_edges import convert_resolved_edges_to_rows
+
+                p_res = extract_pfd_facts(content)
+                p_edges = resolve_menu_options(rel_path, p_res.menu_options, ispf_clist_index)
+
+                p_rows = convert_resolved_edges_to_rows(req.snapshot_id, p_edges, now)
+                edge_inputs.extend(p_rows.file_edge_inputs)
+                _edge_rows.extend(p_rows.file_edge_rows)
+                _symbol_edge_rows.extend(p_rows.symbol_edge_rows)
+                total_edges += len(p_rows.file_edge_inputs)
+                external_edges += sum(1 for inp in p_rows.file_edge_inputs if inp[3] == 1)
+                continue
+            elif language == "clist":
+                from .._ispf import extract_clist_facts, resolve_clist_calls, resolve_clist_submits
+                from .._legacy_edges import convert_resolved_edges_to_rows
+
+                cl_res = extract_clist_facts(content)
+                cl_edges = resolve_clist_calls(rel_path, cl_res.calls, ispf_cbl_index) + resolve_clist_submits(
+                    rel_path, cl_res.submits, ispf_jcl_index
+                )
+
+                cl_rows = convert_resolved_edges_to_rows(req.snapshot_id, cl_edges, now)
+                edge_inputs.extend(cl_rows.file_edge_inputs)
+                _edge_rows.extend(cl_rows.file_edge_rows)
+                _symbol_edge_rows.extend(cl_rows.symbol_edge_rows)
+                total_edges += len(cl_rows.file_edge_inputs)
+                external_edges += sum(1 for inp in cl_rows.file_edge_inputs if inp[3] == 1)
                 continue
 
             if not imports:
@@ -355,7 +417,21 @@ class _BuildMixin:
                             )
                         )
                 elif lang == "jcl":
-                    facts, diag = extract_jcl_enrichment_facts(c_text, rel_path)
+                    from .._jcl.fujitsu_normalize import is_fujitsu_jcl
+                    from .._jcl.fujitsu_normalize import normalize as normalize_fujitsu_jcl
+
+                    fujitsu_result = None
+                    jcl_text = c_text
+                    if is_fujitsu_jcl(c_text):
+                        fujitsu_result = fujitsu_normalize_cache.get(rel_path)
+                        if fujitsu_result is None:
+                            fujitsu_result = normalize_fujitsu_jcl(c_text)
+                            fujitsu_normalize_cache[rel_path] = fujitsu_result
+                        jcl_text = fujitsu_result.normalized_text
+
+                    facts, diag = extract_jcl_enrichment_facts(jcl_text, rel_path)
+                    if fujitsu_result is not None:
+                        facts = facts + fujitsu_result.sidecar_facts
                     for f in facts:
                         _fact_rows.append(
                             (
@@ -399,6 +475,67 @@ class _BuildMixin:
                             "symbolic resolution & PROC expansion",
                             0,
                             "1.0.0",
+                            now,
+                        )
+                    )
+                    if fujitsu_result is not None and fujitsu_result.diagnostics:
+                        _diag_rows.append(
+                            (
+                                req.snapshot_id,
+                                rel_path,
+                                "jcl",
+                                "partial",
+                                len(fujitsu_result.diagnostics),
+                                "Fujitsu dialect opaque/unclassified constructs: "
+                                + "; ".join(fujitsu_result.diagnostics[:5]),
+                                0,
+                                "1.0.0",
+                                now,
+                            )
+                        )
+                elif lang in ("pfd", "clist", "ipf"):
+                    from .._ispf import (
+                        build_clist_enrichment_facts,
+                        build_ipf_enrichment_facts,
+                        build_pfd_enrichment_facts,
+                    )
+
+                    builder = {
+                        "pfd": build_pfd_enrichment_facts,
+                        "clist": build_clist_enrichment_facts,
+                        "ipf": build_ipf_enrichment_facts,
+                    }[lang]
+                    facts, diag = builder(c_text, rel_path)
+                    for f in facts:
+                        _fact_rows.append(
+                            (
+                                req.snapshot_id,
+                                rel_path,
+                                lang,
+                                f["fact_type"],
+                                f["semantic_key"],
+                                f["occurrence_ix"],
+                                f.get("parent_key"),
+                                f.get("name"),
+                                f.get("value"),
+                                json.dumps(f.get("attributes", {})),
+                                f["line_start"],
+                                f["line_end"],
+                                f.get("extractor", f"{lang}_regex"),
+                                f.get("extractor_ver", "1.0.0"),
+                                now,
+                            )
+                        )
+                    _diag_rows.append(
+                        (
+                            req.snapshot_id,
+                            diag["rel_path"],
+                            lang,
+                            diag["status"],
+                            diag["error_count"],
+                            diag.get("first_error"),
+                            diag.get("elapsed_ms", 0),
+                            diag.get("extractor_ver", "1.0.0"),
                             now,
                         )
                     )

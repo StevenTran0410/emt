@@ -7,7 +7,7 @@ from .extract import (
     extract_cobol_all,
     extract_cobol_facts,
 )
-from .preprocess import normalize_cobol_text
+from .preprocess import is_copybook_shaped, normalize_cobol_text
 from .resolve import (
     ResolvedCobolEdge,
     build_copybook_index,
@@ -18,6 +18,7 @@ from .resolve import (
 
 __all__ = [
     "normalize_cobol_text",
+    "is_copybook_shaped",
     "extract_cobol_facts",
     "extract_cobol_all",
     "CobolCallFact",

@@ -2,20 +2,127 @@ import { type Node, type Edge } from '@xyflow/react'
 import dagre from '@dagrejs/dagre'
 import * as d3force from 'd3-force'
 
-export function applyDagreLayout(nodes: Node[], edges: Edge[]): Node[] {
+export interface DagreLayoutOptions {
+  rankdir?: 'TB' | 'LR' | 'BT' | 'RL'
+  nodesep?: number
+  ranksep?: number
+  nodeWidth?: number
+  nodeHeight?: number
+}
+
+export function applyDagreLayout(
+  nodes: Node[],
+  edges: Edge[],
+  options: DagreLayoutOptions = {}
+): Node[] {
+  const rankdir = options.rankdir ?? 'LR'
+  const nodesep = options.nodesep ?? 40
+  const ranksep = options.ranksep ?? 80
+  const nodeWidth = options.nodeWidth ?? 160
+  const nodeHeight = options.nodeHeight ?? 36
+
   const g = new dagre.graphlib.Graph()
-  g.setGraph({ rankdir: 'LR', nodesep: 40, ranksep: 80 })
+  g.setGraph({ rankdir, nodesep, ranksep })
   g.setDefaultEdgeLabel(() => ({}))
 
-  nodes.forEach((n) => g.setNode(n.id, { width: 160, height: 36 }))
+  nodes.forEach((n) => g.setNode(n.id, { width: nodeWidth, height: nodeHeight }))
   edges.forEach((e) => g.setEdge(e.source, e.target))
 
   dagre.layout(g)
 
   return nodes.map((n) => {
     const pos = g.node(n.id)
-    return { ...n, position: { x: pos.x - 80, y: pos.y - 18 } }
+    return { ...n, position: { x: pos.x - nodeWidth / 2, y: pos.y - nodeHeight / 2 } }
   })
+}
+
+export function applyComponentBandedLayout(
+  nodes: Node[],
+  edges: Edge[],
+  options: DagreLayoutOptions & { componentGapY?: number } = {}
+): Node[] {
+  if (nodes.length === 0) return []
+
+  const rankdir = options.rankdir ?? 'LR'
+  const nodesep = options.nodesep ?? 70
+  const ranksep = options.ranksep ?? 120
+  const componentGapY = options.componentGapY ?? 80
+  const nodeHeight = options.nodeHeight ?? 36
+
+  const adj = new Map<string, Set<string>>()
+  nodes.forEach((n) => adj.set(n.id, new Set()))
+  edges.forEach((e) => {
+    if (adj.has(e.source) && adj.has(e.target)) {
+      adj.get(e.source)!.add(e.target)
+      adj.get(e.target)!.add(e.source)
+    }
+  })
+
+  const visited = new Set<string>()
+  const components: Node[][] = []
+  const nodeMap = new Map(nodes.map((n) => [n.id, n]))
+
+  nodes.forEach((node) => {
+    if (visited.has(node.id)) return
+    const compNodes: Node[] = []
+    const queue = [node.id]
+    visited.add(node.id)
+
+    while (queue.length > 0) {
+      const curr = queue.shift()!
+      const nObj = nodeMap.get(curr)
+      if (nObj) compNodes.push(nObj)
+
+      adj.get(curr)?.forEach((neighbor) => {
+        if (!visited.has(neighbor)) {
+          visited.add(neighbor)
+          queue.push(neighbor)
+        }
+      })
+    }
+    components.push(compNodes)
+  })
+
+  components.sort((a, b) => b.length - a.length)
+
+  const resultNodes: Node[] = []
+  let currentYOffset = 0
+
+  components.forEach((compNodes) => {
+    const compNodeIds = new Set(compNodes.map((n) => n.id))
+    const compEdges = edges.filter((e) => compNodeIds.has(e.source) && compNodeIds.has(e.target))
+
+    const laidOut = applyDagreLayout(compNodes, compEdges, {
+      ...options,
+      rankdir,
+      nodesep,
+      ranksep
+    })
+
+    if (laidOut.length === 0) return
+
+    let minY = Infinity
+    let maxY = -Infinity
+    laidOut.forEach((n) => {
+      if (n.position.y < minY) minY = n.position.y
+      if (n.position.y > maxY) maxY = n.position.y
+    })
+
+    const compHeight = maxY - minY + nodeHeight
+
+    const shifted = laidOut.map((n) => ({
+      ...n,
+      position: {
+        x: n.position.x,
+        y: n.position.y - minY + currentYOffset
+      }
+    }))
+
+    resultNodes.push(...shifted)
+    currentYOffset += compHeight + componentGapY
+  })
+
+  return resultNodes
 }
 
 interface ForceNode extends d3force.SimulationNodeDatum {

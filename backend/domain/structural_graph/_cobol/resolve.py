@@ -35,12 +35,21 @@ def build_program_index(cobol_files: dict[str, str | None]) -> dict[str, list[st
 SYSTEM_COPYBOOK_PREFIXES = ("CMQ", "DFH", "IGZ", "CEE", "DSN", "ELX")
 
 
-def build_copybook_index(file_set: set[str]) -> dict[str, list[str]]:
-    """Build map from uppercase copybook stem to list of rel_paths."""
+def build_copybook_index(
+    file_set: set[str], copybook_shaped_paths: set[str] | None = None
+) -> dict[str, list[str]]:
+    """Build map from uppercase copybook stem to list of rel_paths.
+
+    .cpy/.dcl are always copybooks by extension convention. copybook_shaped_paths
+    additionally carries files that were content-sniffed as bare copybooks (no
+    IDENTIFICATION DIVISION) regardless of extension - e.g. copybooks misnamed
+    with a .cob extension - so their COPY resolution finds them too.
+    """
+    shaped = copybook_shaped_paths or set()
     copy_map: dict[str, list[str]] = {}
     for rel_path in file_set:
         lower = rel_path.lower()
-        if lower.endswith(".cpy") or lower.endswith(".dcl"):
+        if lower.endswith(".cpy") or lower.endswith(".dcl") or rel_path in shaped:
             stem = rel_path.rsplit("/", 1)[-1].rsplit(".", 1)[0].upper()
             copy_map.setdefault(stem, []).append(rel_path)
     return copy_map

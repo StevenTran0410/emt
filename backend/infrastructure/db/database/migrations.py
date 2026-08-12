@@ -482,6 +482,145 @@ CREATE TABLE IF NOT EXISTS doc_code_assessments (
 CREATE INDEX IF NOT EXISTS ix_doc_code_assessments_cs ON doc_code_assessments(cluster_id, snapshot_id);
         """,
     },
+    {
+        "version": 6,
+        "description": "Add BD Flow tables for deterministic flow graph skeleton",
+        "sql": """
+CREATE TABLE IF NOT EXISTS bd_flow_nodes (
+  id TEXT PRIMARY KEY,
+  cluster_id TEXT NOT NULL,
+  doc_id TEXT NOT NULL,
+  node_kind TEXT NOT NULL,
+  local_id TEXT,
+  binding TEXT,
+  binding_type TEXT,
+  label TEXT,
+  ordinal INTEGER,
+  guard_text TEXT,
+  source_locator TEXT,
+  provenance_tier TEXT NOT NULL,
+  doc_line_start INTEGER,
+  doc_line_end INTEGER,
+  attributes TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bd_flow_edges (
+  id TEXT PRIMARY KEY,
+  cluster_id TEXT NOT NULL,
+  doc_id TEXT NOT NULL,
+  src_node_id TEXT NOT NULL,
+  dst_node_id TEXT NOT NULL,
+  edge_kind TEXT NOT NULL,
+  label TEXT,
+  guard_text TEXT,
+  provenance_tier TEXT NOT NULL,
+  doc_line INTEGER,
+  attributes TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_bd_flow_nodes_cluster ON bd_flow_nodes(cluster_id);
+CREATE INDEX IF NOT EXISTS ix_bd_flow_edges_cluster ON bd_flow_edges(cluster_id);
+        """,
+    },
+    {
+        "version": 7,
+        "description": "Add BD Flow LLM prose overlay tables (candidate claims + LLM response cache)",
+        "sql": """
+CREATE TABLE IF NOT EXISTS bd_flow_overlay_claims (
+  id TEXT PRIMARY KEY, cluster_id TEXT NOT NULL, doc_id TEXT NOT NULL,
+  chunk_line_start INTEGER, chunk_line_end INTEGER, region_kind TEXT,
+  kind TEXT NOT NULL, relation TEXT, subject_json TEXT, object_json TEXT,
+  guard_json TEXT, citation_json TEXT, modality TEXT,
+  target_fact_id TEXT, tier TEXT NOT NULL,            -- P1|P2|REJECTED
+  reject_reasons TEXT,                                 -- JSON list, null when accepted
+  raw_llm_json TEXT, model_id TEXT, created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bd_flow_llm_cache (
+  cache_key TEXT PRIMARY KEY,   -- sha256 of: doc_sha + chunk span + chunk_sha + prompt_version + schema_version + provider_id + model_id + registry_sha
+  response_json TEXT, status TEXT NOT NULL,            -- ok|invalid  (NEVER cache transport errors)
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_bd_flow_overlay_claims_cluster ON bd_flow_overlay_claims(cluster_id);
+        """,
+    },
+    {
+        "version": 8,
+        "description": "Add Code Flow nodes and edges tables for Phase 3 Business Flow Integrity",
+        "sql": """
+CREATE TABLE IF NOT EXISTS code_flow_nodes (
+  id TEXT PRIMARY KEY,
+  snapshot_id TEXT NOT NULL,
+  node_kind TEXT NOT NULL,
+  binding TEXT,
+  binding_type TEXT,
+  label TEXT,
+  ordinal INTEGER,
+  guard_text TEXT,
+  rel_path TEXT,
+  line_start INTEGER,
+  line_end INTEGER,
+  provenance_tier TEXT NOT NULL,
+  attributes TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS code_flow_edges (
+  id TEXT PRIMARY KEY,
+  snapshot_id TEXT NOT NULL,
+  src_node_id TEXT NOT NULL,
+  dst_node_id TEXT NOT NULL,
+  edge_kind TEXT NOT NULL,
+  label TEXT,
+  guard_text TEXT,
+  rel_path TEXT,
+  line INTEGER,
+  attributes TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_code_flow_nodes_snap ON code_flow_nodes(snapshot_id);
+CREATE INDEX IF NOT EXISTS ix_code_flow_edges_snap ON code_flow_edges(snapshot_id);
+        """,
+    },
+    {
+        "version": 9,
+        "description": "Add Flow Alignment and Flow Verdicts tables for Phase 3 Business Flow Integrity",
+        "sql": """
+CREATE TABLE IF NOT EXISTS flow_alignment (
+  id TEXT PRIMARY KEY,
+  cluster_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  bd_node_id TEXT,
+  code_node_id TEXT,
+  match_method TEXT NOT NULL,
+  tag TEXT NOT NULL,           -- DOC_MATCHED | DOC_CONTRADICTED | CODE_ONLY | BD_ONLY | UNKNOWN
+  ordinal_in_subpath INTEGER,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS flow_verdicts (
+  id TEXT PRIMARY KEY,
+  cluster_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  bd_edge_id TEXT,
+  code_subpath_json TEXT,
+  verdict TEXT NOT NULL,       -- MATCH | PARTIAL | BROKEN | DOC_ONLY | CODE_ONLY | UNKNOWN | RECOVERY_GAP | GRAPH_GAP
+  guard_verdict TEXT,
+  ai_bucket TEXT,              -- fabricated | silent_omission | over_generalized | stale_missing | null
+  reason TEXT NOT NULL,
+  evidence_json TEXT,
+  comparator_version INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_flow_alignment_cluster ON flow_alignment(cluster_id);
+CREATE INDEX IF NOT EXISTS ix_flow_verdicts_cluster ON flow_verdicts(cluster_id);
+        """,
+    },
 ]
 
 TARGET_VERSION = len(_MIGRATIONS) - 1

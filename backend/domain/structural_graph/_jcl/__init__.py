@@ -6,6 +6,7 @@ from .resolve import (
     build_proc_index,
     resolve_jcl_dds,
     resolve_jcl_execs,
+    resolve_jcl_stacks,
 )
 
 __all__ = [
@@ -16,5 +17,6 @@ __all__ = [
     "ResolvedJclEdge",
     "resolve_jcl_execs",
     "resolve_jcl_dds",
+    "resolve_jcl_stacks",
     "build_proc_index",
 ]

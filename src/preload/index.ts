@@ -15,6 +15,9 @@ const sectionDoneListeners = new Map<SectionDoneHandler, (e: unknown, evt: unkno
 type DocGraphStreamHandler = (evt: unknown) => void
 const docGraphStreamListeners = new Map<DocGraphStreamHandler, (e: unknown, evt: unknown) => void>()
 
+type DocGraphActivityHandler = (evt: unknown) => void
+const docGraphActivityListeners = new Map<DocGraphActivityHandler, (e: unknown, evt: unknown) => void>()
+
 const api = {
   app: {
     getVersion: invoke('app:get-version'),
@@ -107,6 +110,15 @@ const api = {
     pickFiles: invoke('docGraph:pickFiles'),
     stageAndBuild: invoke('docGraph:stageAndBuild'),
     buildStream: invoke('docGraph:buildStream'),
+    bdFlowBuild: invoke('docGraph:bdFlowBuild'),
+    bdFlowBuildStream: invoke('docGraph:bdFlowBuildStream'),
+    bdFlowGet: invoke('docGraph:bdFlowGet'),
+    bdFlowOverlayGet: invoke('docGraph:bdFlowOverlayGet'),
+    flowIntegrityGetMap: invoke('docGraph:flowIntegrityGetMap'),
+    flowIntegrityGetFindings: invoke('docGraph:flowIntegrityGetFindings'),
+    flowIntegrityRun: invoke('docGraph:flowIntegrityRun'),
+    flowIntegrityGenerateSummary: invoke('docGraph:flowIntegrityGenerateSummary'),
+    pickBdFile: invoke('docGraph:pickBdFile'),
     onStreamEvent: (handler: DocGraphStreamHandler) => {
       const listener = (_e: unknown, evt: unknown) => handler(evt)
       docGraphStreamListeners.set(handler, listener)
@@ -117,6 +129,18 @@ const api = {
       if (listener) {
         ipcRenderer.removeListener('docGraph:stream', listener)
         docGraphStreamListeners.delete(handler)
+      }
+    },
+    onBdFlowActivity: (handler: DocGraphActivityHandler) => {
+      const listener = (_e: unknown, evt: unknown) => handler(evt)
+      docGraphActivityListeners.set(handler, listener)
+      ipcRenderer.on('docGraph:bdFlowActivity', listener)
+    },
+    offBdFlowActivity: (handler: DocGraphActivityHandler) => {
+      const listener = docGraphActivityListeners.get(handler)
+      if (listener) {
+        ipcRenderer.removeListener('docGraph:bdFlowActivity', listener)
+        docGraphActivityListeners.delete(handler)
       }
     }
   },

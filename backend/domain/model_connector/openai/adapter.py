@@ -120,10 +120,16 @@ class OpenAIAdapter(CloudAdapterBase):
             data = res.json()
             choice = data["choices"][0]
             usage = data.get("usage", {})
+            message = choice.get("message") or {}
+            # Some providers (e.g. DeepSeek via OpenRouter) return content=null and put text in
+            # reasoning_content; coerce to a string so ChatResponse never crashes on a null body.
+            content = message.get("content")
+            if content is None:
+                content = message.get("reasoning_content") or ""
             return ChatResponse(
                 provider_id=self.config.id,
                 model_id=self.config.model_id,
-                content=choice["message"]["content"],
+                content=content,
                 prompt_tokens=usage.get("prompt_tokens"),
                 completion_tokens=usage.get("completion_tokens"),
             )
