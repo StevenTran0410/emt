@@ -15,6 +15,7 @@ from shared.logger import logger
 from shared.utils import utc_now_iso
 
 from .._flow_extract import extract_bd_flow
+from .._flow_group import run_bd_flow_grouping
 from .._flow_overlay import run_bd_flow_overlay
 from .._graph_model import build_assertions_and_projection
 from .._llm_citation import run_llm_citation_tier, run_llm_citation_tier_stream
@@ -252,6 +253,12 @@ class _BuildMixin:
 
         # Extract and persist BD flow rows
         await _save_bd_flow(db, [parsed_doc], cluster_id)
+        try:
+            await run_bd_flow_grouping(
+                db, [parsed_doc], cluster_id, llm_enabled=req.llm_enabled, provider_id=req.llm_provider_id
+            )
+        except Exception as exc:
+            logger.warning("[doc_graph] BD flow grouping failed for cluster %s: %s", cluster_id, exc)
 
         # Count extracted flow nodes and edges
         async with db.execute(
@@ -367,6 +374,12 @@ class _BuildMixin:
                 await db.commit()
 
             await _save_bd_flow(db, [parsed_doc], cluster_id)
+            try:
+                await run_bd_flow_grouping(
+                    db, [parsed_doc], cluster_id, llm_enabled=req.llm_enabled, provider_id=req.llm_provider_id
+                )
+            except Exception as exc:
+                logger.warning("[doc_graph] BD flow grouping failed for cluster %s: %s", cluster_id, exc)
 
             async with db.execute(
                 "SELECT COUNT(*) as cnt FROM bd_flow_nodes WHERE cluster_id=?", (cluster_id,)
@@ -872,6 +885,12 @@ class _BuildMixin:
 
                 await db.commit()
                 await _save_bd_flow(db, parsed_docs, cluster_id)
+                try:
+                    await run_bd_flow_grouping(
+                        db, parsed_docs, cluster_id, llm_enabled=req.llm_enabled, provider_id=req.llm_provider_id
+                    )
+                except Exception as exc:
+                    logger.warning("[doc_graph] BD flow grouping failed for cluster %s: %s", cluster_id, exc)
                 if req.llm_enabled:
                     try:
                         await run_bd_flow_overlay(db, parsed_docs, cluster_id, req.llm_provider_id)

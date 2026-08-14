@@ -1,4 +1,4 @@
-import { type Node, type Edge } from '@xyflow/react'
+import { type Node, type Edge, MarkerType } from '@xyflow/react'
 import dagre from '@dagrejs/dagre'
 import * as d3force from 'd3-force'
 
@@ -287,4 +287,223 @@ export function applyLaneAlignedLayout(
   }
 
   return { anchorNodes: laidOutAnchor, secondaryNodes: laidOutSecondary }
+}
+
+export interface BusinessFlowSkeletonOptions {
+  maxCols?: number
+  paddingX?: number
+  paddingY?: number
+  titleOffset?: number
+}
+
+/**
+ * Pure/deterministic Business Flow Skeleton layout engine (TICKET P4-1-UI).
+ * Lays out step nodes + branch edges per flow using Dagre TB, stacks flows into a grid,
+ * and emitsGroupHullNode background containers.
+ */
+export function projectBusinessFlowSkeleton(
+  flows: any[],
+  options: BusinessFlowSkeletonOptions = {}
+): { nodes: Node[]; edges: Edge[] } {
+  if (!flows || flows.length === 0) {
+    return { nodes: [], edges: [] }
+  }
+
+  const paddingX = options.paddingX ?? 24
+  const paddingY = options.paddingY ?? 24
+  const titleOffset = options.titleOffset ?? 36
+
+  // Sort flows by (ordinal, id)
+  const sortedFlows = [...flows].sort((a, b) => {
+    if (a.ordinal !== b.ordinal) return a.ordinal - b.ordinal
+    return String(a.id).localeCompare(String(b.id))
+  })
+
+  const maxCols = options.maxCols ?? (sortedFlows.length > 6 ? 2 : 1)
+
+  const allNodes: Node[] = []
+  const allEdges: Edge[] = []
+
+  const colWidths: number[] = new Array(maxCols).fill(0)
+  const rowHeights: number[] = []
+
+  const flowLayouts: {
+    flow: any
+    nodes: Node[]
+    edges: Edge[]
+    bbox: { minX: number; minY: number; maxX: number; maxY: number; width: number; height: number }
+    col: number
+    row: number
+  }[] = []
+
+  sortedFlows.forEach((flow, index) => {
+    const col = index % maxCols
+    const row = Math.floor(index / maxCols)
+
+    const stepNodes: Node[] = (flow.steps || []).map((step: any) => ({
+      id: step.id,
+      type: 'businessStep',
+      position: { x: 0, y: 0 },
+      width: 220,
+      height: 80,
+      style: { width: 220, height: 80 },
+      data: {
+        step,
+        flow,
+        flowId: flow.id,
+        name: step.name,
+        functionality: step.functionality,
+        origin: flow.origin
+      }
+    }))
+
+    const stepIdSet = new Set(stepNodes.map((n) => n.id))
+    const endNodes: Node[] = []
+    const branchEdges: Edge[] = []
+
+    ;(flow.branches || []).forEach((branch: any) => {
+      const hasTarget = branch.target_step_id && stepIdSet.has(branch.target_step_id)
+      const targetId = hasTarget ? branch.target_step_id! : `${branch.id}:end`
+
+      if (!hasTarget) {
+        endNodes.push({
+          id: `${branch.id}:end`,
+          type: 'branchEnd',
+          position: { x: 0, y: 0 },
+          width: 100,
+          height: 32,
+          style: { width: 100, height: 32 },
+          data: {
+            kind: branch.branch_kind,
+            branch,
+            flowId: flow.id
+          }
+        })
+      }
+
+      let strokeColor = '#6b7280' // OTHER
+      if (branch.branch_kind === 'SUCCESS') strokeColor = '#10b981'
+      else if (branch.branch_kind === 'FAILURE') strokeColor = '#ef4444'
+      else if (branch.branch_kind === 'ERROR') strokeColor = '#f59e0b'
+
+      const g = branch.guard_description || ''
+      const short = g.length > 22 ? g.slice(0, 22) + '…' : g
+
+      branchEdges.push({
+        id: branch.id,
+        source: branch.source_step_id,
+        target: targetId,
+        type: 'businessBranch',
+        style: { stroke: strokeColor, strokeWidth: 1.5 },
+        markerEnd: { type: MarkerType.ArrowClosed, width: 18, height: 18, color: strokeColor },
+        data: {
+          label: short,
+          guard: branch.guard_description,
+          strokeColor,
+          branch_kind: branch.branch_kind,
+          branch,
+          labelOffset: { dx: 0, dy: 0 }
+        }
+      })
+    })
+
+    const flowNodes = [...stepNodes, ...endNodes]
+    if (flowNodes.length === 0) return
+
+    // Run Dagre TB layout for this single flow
+    const laidOutFlowNodes = applyDagreLayout(flowNodes, branchEdges, {
+      rankdir: 'TB',
+      nodeWidth: 220,
+      nodeHeight: 80,
+      nodesep: 90,
+      ranksep: 110
+    })
+
+    let minX = Infinity
+    let minY = Infinity
+    let maxX = -Infinity
+    let maxY = -Infinity
+
+    laidOutFlowNodes.forEach((n) => {
+      const w = n.width || 220
+      const h = n.height || 80
+      if (n.position.x < minX) minX = n.position.x
+      if (n.position.y < minY) minY = n.position.y
+      if (n.position.x + w > maxX) maxX = n.position.x + w
+      if (n.position.y + h > maxY) maxY = n.position.y + h
+    })
+
+    if (!isFinite(minX) || !isFinite(maxX)) {
+      minX = 0
+      minY = 0
+      maxX = 220
+      maxY = 80
+    }
+
+    const bboxWidth = Math.max(260, maxX - minX + paddingX * 2)
+    const bboxHeight = Math.max(120, maxY - minY + paddingY * 2 + titleOffset)
+
+    if (bboxWidth > colWidths[col]) colWidths[col] = bboxWidth
+    if (rowHeights.length <= row) rowHeights[row] = bboxHeight
+    else if (bboxHeight > rowHeights[row]) rowHeights[row] = bboxHeight
+
+    flowLayouts.push({
+      flow,
+      nodes: laidOutFlowNodes,
+      edges: branchEdges,
+      bbox: { minX, minY, maxX, maxY, width: bboxWidth, height: bboxHeight },
+      col,
+      row
+    })
+  })
+
+  // Calculate cumulative X offsets for columns and Y offsets for rows
+  const colXOffset: number[] = [40]
+  for (let c = 1; c < maxCols; c++) {
+    colXOffset[c] = colXOffset[c - 1] + colWidths[c - 1] + 80
+  }
+
+  const rowYOffset: number[] = [40]
+  for (let r = 1; r < rowHeights.length; r++) {
+    rowYOffset[r] = rowYOffset[r - 1] + rowHeights[r - 1] + 60
+  }
+
+  // Shift nodes/edges into final grid position and emit GroupHullNode
+  flowLayouts.forEach(({ flow, nodes, edges, bbox, col, row }) => {
+    const gridX = colXOffset[col]
+    const gridY = rowYOffset[row]
+
+    const hullNode: Node = {
+      id: `group:${flow.id}`,
+      type: 'group',
+      position: { x: gridX, y: gridY },
+      style: { width: bbox.width, height: bbox.height },
+      data: {
+        label: flow.name,
+        sublabel: `${flow.block_key} · ${flow.origin}`,
+        width: bbox.width,
+        height: bbox.height,
+        accentColor: flow.origin === 'llm' ? '#6366f1' : '#f59e0b',
+        flowId: flow.id
+      },
+      zIndex: -1,
+      selectable: false,
+      draggable: false
+    }
+
+    allNodes.push(hullNode)
+
+    const shiftedNodes = nodes.map((n) => ({
+      ...n,
+      position: {
+        x: n.position.x - bbox.minX + gridX + paddingX,
+        y: n.position.y - bbox.minY + gridY + paddingY + titleOffset
+      }
+    }))
+
+    allNodes.push(...shiftedNodes)
+    allEdges.push(...edges)
+  })
+
+  return { nodes: allNodes, edges: allEdges }
 }

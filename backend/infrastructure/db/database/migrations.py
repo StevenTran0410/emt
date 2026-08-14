@@ -621,6 +621,142 @@ CREATE INDEX IF NOT EXISTS ix_flow_alignment_cluster ON flow_alignment(cluster_i
 CREATE INDEX IF NOT EXISTS ix_flow_verdicts_cluster ON flow_verdicts(cluster_id);
         """,
     },
+    {
+        "version": 10,
+        "description": "Add Business Flow grouping tables for Phase 4 Big-Picture Business Flow Integrity",
+        "sql": """
+CREATE TABLE IF NOT EXISTS bd_business_flows (
+  id TEXT PRIMARY KEY,
+  cluster_id TEXT NOT NULL,
+  doc_id TEXT NOT NULL,
+  sub_ix INTEGER NOT NULL,
+  block_key TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  origin TEXT NOT NULL,         -- 'llm' | 'fallback'
+  model_id TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bd_business_steps (
+  id TEXT PRIMARY KEY,
+  flow_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  functionality TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  source_node_ids TEXT NOT NULL, -- JSON array of bd_flow_nodes.id
+  doc_line_start INTEGER,
+  doc_line_end INTEGER,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bd_business_branches (
+  id TEXT PRIMARY KEY,
+  flow_id TEXT NOT NULL,
+  source_step_id TEXT NOT NULL,
+  target_step_id TEXT,          -- NULL for terminal outcome
+  branch_kind TEXT NOT NULL,     -- 'SUCCESS' | 'FAILURE' | 'ERROR' | 'OTHER'
+  guard_description TEXT NOT NULL,
+  source_edge_ids TEXT NOT NULL, -- JSON array of bd_flow_edges.id
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_bd_business_flows_cluster ON bd_business_flows(cluster_id);
+CREATE INDEX IF NOT EXISTS ix_bd_business_steps_flow ON bd_business_steps(flow_id);
+CREATE INDEX IF NOT EXISTS ix_bd_business_branches_flow ON bd_business_branches(flow_id);
+        """,
+    },
+    {
+        "version": 11,
+        "description": "Add business_unit_verdicts table for Phase 4 Unit-Level Business Flow Integrity",
+        "sql": """
+CREATE TABLE IF NOT EXISTS business_unit_verdicts (
+  id TEXT PRIMARY KEY,
+  cluster_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  unit_kind TEXT NOT NULL,       -- 'step' | 'branch'
+  mapping_status TEXT NOT NULL,  -- 'MAPPED' | 'NO_SAFE_MATCH' | 'AMBIGUOUS'
+  mapping_method TEXT NOT NULL,  -- 'llm' | 'exact_binding' | 'offline'
+  route_segment_json TEXT,       -- JSON object of mapped segment or NULL
+  verdict TEXT NOT NULL,         -- 'MATCH' | 'PARTIAL' | 'BROKEN' | 'UNKNOWN'
+  guard_verdict TEXT,
+  ai_bucket TEXT,                -- 'fabricated' | 'silent_omission' | 'over_generalized' | 'stale_missing' | null
+  reason TEXT NOT NULL,
+  evidence_json TEXT,
+  comparator_version INTEGER NOT NULL DEFAULT 2,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_business_unit_verdicts_cluster ON business_unit_verdicts(cluster_id);
+CREATE INDEX IF NOT EXISTS ix_business_unit_verdicts_unit ON business_unit_verdicts(unit_id);
+        """,
+    },
+    {
+        "version": 12,
+        "description": "Persist Phase 4 LLM outputs (per-flow narratives + executive summary) so LLM-blocked machines read stored text",
+        "sql": """
+CREATE TABLE IF NOT EXISTS business_flow_llm_output (
+  id TEXT PRIMARY KEY,
+  cluster_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  kind TEXT NOT NULL,        -- 'narrative' | 'summary'
+  ref_id TEXT NOT NULL,      -- flow_id for 'narrative'; '*' for 'summary'
+  content TEXT NOT NULL,     -- narrative paragraph text; or summary JSON
+  origin TEXT,               -- 'llm' | 'fallback'
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_business_flow_llm_output_scope ON business_flow_llm_output(cluster_id, snapshot_id, kind);
+        """,
+    },
+    {
+        "version": 13,
+        "description": "Add bfi_evidence_occurrences table for Phase 5 occurrence-level evidence index",
+        "sql": """
+CREATE TABLE IF NOT EXISTS bfi_evidence_occurrences (
+  id            TEXT PRIMARY KEY,
+  snapshot_id   TEXT NOT NULL,
+  rel_path      TEXT NOT NULL,
+  language      TEXT NOT NULL,
+  kind          TEXT NOT NULL,
+  edge_type     TEXT,
+  src_binding   TEXT,
+  dst_binding   TEXT,
+  dst_rel_path  TEXT,
+  guard_json    TEXT,
+  occurrence_ix INTEGER NOT NULL,
+  line_start    INTEGER NOT NULL,
+  line_end      INTEGER NOT NULL,
+  parse_status  TEXT NOT NULL,
+  source_fact_id INTEGER,
+  attributes    TEXT NOT NULL DEFAULT '{}',
+  created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_evocc_snap ON bfi_evidence_occurrences(snapshot_id);
+CREATE INDEX IF NOT EXISTS ix_evocc_snap_file ON bfi_evidence_occurrences(snapshot_id, rel_path);
+CREATE INDEX IF NOT EXISTS ix_evocc_snap_dst ON bfi_evidence_occurrences(snapshot_id, dst_binding);
+        """,
+    },
+    {
+        "version": 14,
+        "description": "Add bfi_run_artifacts table (append-only) for Phase 5 source-aware verifier run replay/audit",
+        "sql": """
+CREATE TABLE IF NOT EXISTS bfi_run_artifacts (
+  id          TEXT PRIMARY KEY,     -- "bfart:{run_id}:{unit_id}"
+  run_id      TEXT NOT NULL,        -- uuid4 generated once per Run
+  cluster_id  TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  unit_id     TEXT NOT NULL,
+  payload     TEXT NOT NULL,        -- JSON, see _verifier.py
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_bfart_run  ON bfi_run_artifacts(run_id);
+CREATE INDEX IF NOT EXISTS ix_bfart_unit ON bfi_run_artifacts(snapshot_id, unit_id);
+        """,
+    },
 ]
 
 TARGET_VERSION = len(_MIGRATIONS) - 1
+

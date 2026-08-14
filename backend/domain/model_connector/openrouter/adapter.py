@@ -15,6 +15,10 @@ from domain.model_connector.types import ChatRequest, ProviderConfig
 _MIN_OUTPUT_TOKENS = 2000
 _OUTPUT_RESERVE_FRACTION = 0.10
 _MIN_REASONING_TOKENS = 256
+# Real per-tier ceilings. Kept deliberately modest so reasoning tokens don't starve the answer
+# (a 45k thinking budget left only ~5k for output and caused empty completions). "high" is the
+# default judgment tier at 15k; "max" (30k) is reserved for genuinely reasoning-heavy calls.
+_TIER_BUDGETS: dict[str, int] = {"low": 4000, "medium": 12000, "high": 15000, "max": 30000}
 
 
 class OpenRouterAdapter(OpenAIAdapter):
@@ -64,6 +68,10 @@ class OpenRouterAdapter(OpenAIAdapter):
         cap = max(_MIN_REASONING_TOKENS, total - output_reserve)
         if request.thinking_budget:
             return min(request.thinking_budget, cap)
+        # low/medium get a real (smaller) ceiling; high/max/unrecognized keep the full cap.
+        tier_budget = _TIER_BUDGETS.get((request.reasoning_effort or "").lower())
+        if tier_budget is not None:
+            return min(tier_budget, cap)
         return cap
 
     def _build_payload(self, request: ChatRequest) -> dict:

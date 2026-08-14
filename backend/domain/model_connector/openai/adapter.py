@@ -93,18 +93,25 @@ class OpenAIAdapter(CloudAdapterBase):
         model_rejects_temp = any(mid.startswith(p) for p in self._NO_TEMPERATURE_PREFIXES)
         if request.temperature is not None and not model_rejects_temp:
             payload["temperature"] = request.temperature
-        if model_rejects_temp and request.reasoning_effort:
-            payload["reasoning_effort"] = request.reasoning_effort
+        # Per-provider reasoning override: e.g. force this provider's model (deepseek-v4-pro) to a
+        # fixed effort via extra.default_reasoning_effort, regardless of the per-stage effort the
+        # caller asked for. Falls back to the request's effort when unset.
+        req_effort = ((self.config.extra or {}).get("default_reasoning_effort") or request.reasoning_effort) or None
+        if model_rejects_temp and req_effort:
+            payload["reasoning_effort"] = req_effort
 
-        # DeepSeek V4 over the OpenAI-compatible endpoint: an explicit thinking toggle plus
-        # reasoning_effort. "disable" (or unset) turns thinking off; "high"/"max" turns it on.
+        # DeepSeek V4 separates the thinking TOGGLE from the effort LEVEL. low / high / max are all
+        # thinking-ENABLED effort levels (V4 defaults to on/high); ONLY an explicit none/off/disable
+        # turns thinking off. "low" therefore means thinking on with low effort — fast but still
+        # reasoning — NOT thinking disabled.
         if classify(self.config.kind, self.config.model_id or "") == ReasoningStyle.EFFORT_TOGGLE:
-            effort = (request.reasoning_effort or "").lower()
-            if effort in ("high", "max"):
-                payload["thinking"] = {"type": "enabled"}
-                payload["reasoning_effort"] = effort
-            else:
+            effort = (req_effort or "").lower()
+            if effort in ("none", "disable", "off"):
                 payload["thinking"] = {"type": "disabled"}
+            else:
+                payload["thinking"] = {"type": "enabled"}
+                # DeepSeek accepts low/high/max; map our "medium" up to "high" and blank to "high".
+                payload["reasoning_effort"] = {"": "high", "medium": "high"}.get(effort, effort)
         # json_object mode is supported by gpt-4o, gpt-4-turbo, gpt-3.5-turbo-1106+
         # but NOT by o1/o3/o4/gpt-5 reasoning models.
         if request.json_mode and not model_rejects_temp:
@@ -168,6 +175,11 @@ class OpenAIAdapter(CloudAdapterBase):
                 "POST", self._url("chat/completions"),
                 json=payload, headers=self._auth(),
             ) as resp:
+                if resp.status_code >= 400:
+                    # Read the error body while the stream is still open, so the error mapper's
+                    # .json()/.text can access it instead of raising "streaming content without read()"
+                    # (which would mask the real status, e.g. a 429 rate limit).
+                    await resp.aread()
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):

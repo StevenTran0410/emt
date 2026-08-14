@@ -90,14 +90,19 @@ export interface BdFlowOverlayClaim {
   id: string
   cluster_id: string
   doc_id: string
-  claim_kind: string
-  subject: string
+  claim_kind?: string
+  kind?: string
+  subject?: string
   relation: string
-  object: string | null
-  modality: string | null
+  object?: string | null
+  subject_json?: any
+  object_json?: any
+  guard_json?: any
+  citation_json?: any
+  modality?: string | null
   tier: 'P1' | 'P2' | 'REJECTED' | string
-  doc_line_start: number
-  doc_line_end: number
+  doc_line_start?: number
+  doc_line_end?: number
   reject_reasons?: string[]
   attributes?: Record<string, any> | string | null
 }
@@ -176,11 +181,121 @@ export interface FlowIntegrityMapEdge {
   }
 }
 
+export interface BusinessUnitAnnotation {
+  verdict: 'MATCH' | 'PARTIAL' | 'BROKEN' | 'UNKNOWN' | string
+  mapping_status: 'MAPPED' | 'NO_SAFE_MATCH' | 'AMBIGUOUS' | string
+  mapping_method: 'llm' | 'exact_binding' | 'offline' | string
+  guard_verdict: string | null
+  ai_bucket: string | null
+  reason: string
+  evidence: {
+    corroboration_ratio: number
+    corroborated_bindings: string[]
+    contradicted_nodes: any[]
+    confidence?: string
+  } | null
+  segment: {
+    segment_id: string
+    node_ids: string[]
+    edge_ids: string[]
+    bindings: string[]
+    rel_paths: string[]
+  } | null
+  citations?: BusinessUnitCitation[]
+  aspects?: BusinessUnitAspects | null
+}
+
 export interface FlowIntegrityMapResponse {
   cluster_id: string
   snapshot_id: string
   nodes: FlowIntegrityMapNode[]
   edges: FlowIntegrityMapEdge[]
+  business_flows_present?: boolean
+  unit_annotations?: Record<string, BusinessUnitAnnotation>
+}
+
+export interface BusinessFlowRollup {
+  flow_id: string
+  flow_name: string
+  steps_total: number
+  steps_matched: number
+  steps_backed?: number
+  branches_total: number
+  units_matched?: number
+  total_expected?: number
+  units_broken: number
+  units_unknown: number
+  status: string
+  sub_ix?: number | null
+  section_name?: string
+  block_key?: string | null
+  doc_line_start?: number | null
+  doc_line_end?: number | null
+  description?: string | null
+  narrative?: string
+}
+
+export interface BusinessUnitCitation {
+  rel_path: string
+  line_start: number
+  line_end: number
+  fetched_text?: string | null
+}
+
+export interface BusinessUnitAspects {
+  target_reachable?: string
+  guard_equivalence?: string
+  route_order?: string
+  negative_modality?: string
+}
+
+export interface BusinessUnitDetail {
+  flow_id: string
+  flow_name: string
+  unit_id: string
+  unit_name: string
+  unit_kind: 'step' | 'branch' | string
+  prose?: string | null
+  verdict: string
+  reason: string
+  reason_codes?: string[]
+  citations?: BusinessUnitCitation[]
+  aspects?: BusinessUnitAspects | null
+  branch_kind?: string | null
+  source_step_id?: string | null
+  target_step_id?: string | null
+  target_step_name?: string | null
+  evidence?: {
+    corroboration_ratio: number
+    corroborated_bindings: string[]
+    contradicted_nodes: any[]
+    confidence?: string
+  } | null
+  segment?: {
+    bindings: string[]
+    rel_paths: string[]
+  } | null
+}
+
+
+export interface BusinessFindingsPayload {
+  calibration: {
+    match_percentage: number
+    total_units: number
+    resolved_units: number
+    match_count: number
+    partial_count: number
+    broken_count: number
+    unknown_count: number
+    calibration_pass: boolean
+    fail_blind: boolean
+  }
+  per_flow: BusinessFlowRollup[]
+  matched_units: BusinessUnitDetail[]
+  contradicted_units: BusinessUnitDetail[]
+  unknown_units: BusinessUnitDetail[]
+  code_only_segments?: any[]
+  executive_summary?: FlowIntegrityExecutiveSummary | null
 }
 
 export interface FlowIntegrityFindingsResponse {
@@ -192,6 +307,7 @@ export interface FlowIntegrityFindingsResponse {
   code_only_findings: FlowIntegrityFindingRow[]
   recovery_gaps: FlowIntegrityFindingRow[]
   collapsed_unknown_count: number
+  business?: BusinessFindingsPayload
 }
 
 export interface FlowIntegrityExecutiveSummary {
@@ -973,6 +1089,45 @@ export interface BdGroupItem {
   evidence: any[]
 }
 
+export interface BusinessFlowStep {
+  id: string
+  flow_id: string
+  name: string
+  functionality: string
+  ordinal: number
+  source_node_ids: string[]
+  doc_line_start?: number | null
+  doc_line_end?: number | null
+  created_at: string
+}
+
+export interface BusinessFlowBranch {
+  id: string
+  flow_id: string
+  source_step_id: string
+  target_step_id?: string | null
+  branch_kind: 'SUCCESS' | 'FAILURE' | 'ERROR' | 'OTHER'
+  guard_description: string
+  source_edge_ids: string[]
+  created_at: string
+}
+
+export interface BusinessFlow {
+  id: string
+  cluster_id: string
+  doc_id: string
+  sub_ix: number
+  block_key: string
+  name: string
+  description: string
+  ordinal: number
+  origin: 'llm' | 'fallback'
+  model_id?: string | null
+  created_at: string
+  steps: BusinessFlowStep[]
+  branches: BusinessFlowBranch[]
+}
+
 export interface LinkedGraphResult {
   cluster_id: string
   snapshot_id: string
@@ -1128,9 +1283,11 @@ declare global {
           overlay_counts: { P1: number; P2: number; REJECTED: number } | null
         }>
         bdFlowBuildStream: (body: { bd_path: string; snapshot_id?: string | null; llm_enabled?: boolean; llm_provider_id?: string | null }) => Promise<{ ok: boolean }>
+
         bdFlowGet: (clusterId: string) => Promise<{
           nodes: BdFlowNode[]
           edges: BdFlowEdge[]
+          business_flows?: BusinessFlow[]
           diagnostics_count: number
         }>
         bdFlowOverlayGet: (clusterId: string) => Promise<{

@@ -320,9 +320,56 @@ class _QueryMixin:
                     pass
             edges.append(d)
 
+        # Fetch Business Flows (TICKET P4-1)
+        async with db.execute(
+            "SELECT * FROM bd_business_flows WHERE cluster_id=? ORDER BY ordinal, id",
+            (cluster_id,),
+        ) as cur:
+            flow_rows = [dict(r) for r in await cur.fetchall()]
+
+        flow_ids = [f["id"] for f in flow_rows]
+        steps_by_flow: dict[str, list[dict[str, Any]]] = {}
+        branches_by_flow: dict[str, list[dict[str, Any]]] = {}
+
+        if flow_ids:
+            placeholders = ",".join("?" for _ in flow_ids)
+            async with db.execute(
+                f"SELECT * FROM bd_business_steps WHERE flow_id IN ({placeholders}) ORDER BY ordinal, id",
+                flow_ids,
+            ) as cur:
+                for r in await cur.fetchall():
+                    s = dict(r)
+                    if s.get("source_node_ids"):
+                        try:
+                            s["source_node_ids"] = json.loads(s["source_node_ids"])
+                        except Exception:
+                            pass
+                    steps_by_flow.setdefault(s["flow_id"], []).append(s)
+
+            async with db.execute(
+                f"SELECT * FROM bd_business_branches WHERE flow_id IN ({placeholders}) ORDER BY id",
+                flow_ids,
+            ) as cur:
+                for r in await cur.fetchall():
+                    b = dict(r)
+                    if b.get("source_edge_ids"):
+                        try:
+                            b["source_edge_ids"] = json.loads(b["source_edge_ids"])
+                        except Exception:
+                            pass
+                    branches_by_flow.setdefault(b["flow_id"], []).append(b)
+
+        business_flows = []
+        for f in flow_rows:
+            f_dict = dict(f)
+            f_dict["steps"] = steps_by_flow.get(f["id"], [])
+            f_dict["branches"] = branches_by_flow.get(f["id"], [])
+            business_flows.append(f_dict)
+
         return {
             "nodes": nodes,
             "edges": edges,
+            "business_flows": business_flows,
             "diagnostics_count": 0,
         }
 

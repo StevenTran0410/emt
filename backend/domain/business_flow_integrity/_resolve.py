@@ -28,8 +28,15 @@ def _extension_matches(rel_path: str, asset_type: str | None) -> bool:
         return ext == ".clist"
     if "JCL" in atype or atype in ("JOB",):
         return ext in (".jcl", ".prc")
-    if "COBOL" in atype or "CBL" in atype or atype in ("PROGRAM", "STEP"):
+    if "COBOL" in atype or "CBL" in atype:
         return ext in (".cbl", ".cob")
+    # BD prose uses "program"/"step" generically for any routed executable (COBOL, CLIST,
+    # PFD/menu, JCL, ISPF) — not COBOL-exclusively. Accept the whole executable family so
+    # generic-typed references (e.g. PHNIXLOT.clist, HSBMENU5.pfd) resolve instead of being
+    # dropped to UNKNOWN. Genuine multi-candidate collisions degrade to AMBIGUOUS, which the
+    # _align candidate ranker then disambiguates by real node_kind.
+    if atype in ("PROGRAM", "STEP"):
+        return ext in (".cbl", ".cob", ".clist", ".pfd", ".ipf", ".jcl", ".prc")
     if "PANEL" in atype or "IPF" in atype or "PFD" in atype or atype in ("SCREEN",):
         return ext in (".ipf", ".pfd")
 

@@ -7,14 +7,14 @@ import json
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict
 
 from shared.logger import logger
 from shared.utils import utc_now_iso
 
 from ..doc_graph._llm_citation import _parse_llm_json
-from ..model_connector.service import ProviderConfigService
 from ..model_connector.types import ChatMessage, ChatRequest
+from ._llm import call_with_reasoning_ladder
 
 LLM_BATCH_SIZE = 5
 
@@ -132,41 +132,28 @@ async def _evaluate_llm_batch(
             for u in batch_units
         ]
 
-        req = ChatRequest(
-            provider_id=provider_id,
-            messages=[
-                ChatMessage(role="system", content=_BATCH_SYSTEM_PROMPT),
-                ChatMessage(role="user", content=json.dumps(prompt_payload, indent=2)),
-            ],
-            stream=True,
-            max_completion_tokens=6000,
-            temperature=0.0,
-            json_mode=True,
-            # Bounded reasoning: with effort=None some providers (deepseek) spend the whole
-            # budget on reasoning and emit empty content — the batch then silently falls back.
-            reasoning_effort="low",
-        )
+        def _build_req(effort: str) -> ChatRequest:
+            return ChatRequest(
+                provider_id=provider_id,
+                messages=[
+                    ChatMessage(role="system", content=_BATCH_SYSTEM_PROMPT),
+                    ChatMessage(role="user", content=json.dumps(prompt_payload, indent=2)),
+                ],
+                stream=True,
+                max_completion_tokens=50000,
+                temperature=0.0,
+                json_mode=True,
+                reasoning_effort=effort,
+            )
 
-        full_text = ""
-        try:
-            async for evt in ProviderConfigService().chat_stream_events(req):
-                if evt.get("type") == "content":
-                    full_text += evt.get("text") or ""
-        except Exception as e:
-            logger.warning(f"BFI batched LLM stream error: {e}")
-            return {}
-
-        if not full_text.strip():
-            logger.warning("BFI LLM batch returned empty content")
-            return {}
-
-        try:
-            parsed_json = _parse_llm_json(full_text)
+        def _parse(text: str) -> dict[str, LLMUnitVerdictResponse]:
+            parsed_json = _parse_llm_json(text)
             validated = LLMBatchVerdictResponse.model_validate(parsed_json)
             return {r.unit_id: r for r in validated.results}
-        except (ValueError, ValidationError) as ve:
-            logger.warning(f"BFI LLM batch parse/validation error: {ve}")
-            return {}
+
+        # Judgment task (verdict decision) — open at high reasoning, one low-effort retry on failure.
+        ladder_res = await call_with_reasoning_ladder(_build_req, _parse, first_effort="high", label="BFI verdict batch")
+        return ladder_res[0] if ladder_res is not None else {}
 
 
 async def run_flow_verdicts(
@@ -473,3 +460,239 @@ async def run_flow_verdicts(
         code_only_count=code_only_cnt,
         unknown_count=unknown_cnt,
     )
+
+
+@dataclass(frozen=True)
+class UnitVerdictRecord:
+    id: str
+    cluster_id: str
+    snapshot_id: str
+    unit_id: str
+    unit_kind: Literal["step", "branch"]
+    mapping_status: str
+    mapping_method: str
+    route_segment_json: str | None
+    verdict: FlowVerdict
+    guard_verdict: str | None
+    ai_bucket: AiBucket | None
+    reason: str
+    evidence_json: str
+    comparator_version: int = 2
+
+
+@dataclass(frozen=True)
+class UnitVerdictResult:
+    cluster_id: str
+    snapshot_id: str
+    verdicts: list[UnitVerdictRecord]
+    match_percentage: float
+    total_units: int
+    resolved_units: int
+    match_count: int
+    partial_count: int
+    broken_count: int
+    unknown_count: int
+
+
+async def run_unit_verdicts(
+    db: Any, cluster_id: str, snapshot_id: str, provider_id: str | None = None
+) -> UnitVerdictResult:
+    """Run Phase 4 unit-level verdicts (step & branch) with warrant gating and LLM refine."""
+    from ._map import run_unit_mapping
+
+    mappings = await run_unit_mapping(db, cluster_id, snapshot_id, provider_id=provider_id)
+    unit_records: list[UnitVerdictRecord] = []
+    llm_candidate_units: list[dict[str, Any]] = []
+
+    for m in mappings:
+        record_id = f"unit_verdict:{cluster_id}:{m.unit_id}"
+        base_verdict: FlowVerdict = "UNKNOWN"
+        guard_verdict: str | None = None
+        ai_bucket: AiBucket | None = None
+        reason = m.reason
+        seg_json = json.dumps(m.mapped_segment.to_dict()) if m.mapped_segment else None
+
+        evidence_dict = {
+            "corroboration_ratio": m.corroboration_ratio,
+            "corroborated_bindings": m.corroborated_bindings,
+            "contradicted_nodes": m.contradicted_nodes,
+            "mapping_status": m.mapping_status,
+            "mapping_method": m.mapping_method,
+            "confidence": m.confidence,
+        }
+
+        if m.contradicted_nodes:
+            # A deterministic contradiction is a real integrity failure and outranks "couldn't map".
+            base_verdict = "BROKEN"
+            ai_bucket = "stale_missing"
+            c_file = m.contradicted_nodes[0].get("rel_path") or m.contradicted_nodes[0].get("binding")
+            reason = f"BD step claims missing/unresolved asset ({c_file}), contradicted by code graph"
+        elif m.mapping_status == "NO_SAFE_MATCH":
+            base_verdict = "UNKNOWN"
+            reason = "No code route can be safely associated with this step (external boundary or prose-only)."
+        elif m.mapping_status == "MAPPED" and m.unit_kind == "step":
+            if m.corroboration_ratio >= 0.8:
+                base_verdict = "MATCH"
+                reason = f"Step mapped to segment {m.mapped_segment.segment_id} with deterministic warrant (ratio {m.corroboration_ratio:.2f})"
+            elif m.corroboration_ratio > 0.0:
+                base_verdict = "PARTIAL"
+                reason = f"Step partially corroborated into segment {m.mapped_segment.segment_id} (ratio {m.corroboration_ratio:.2f})"
+            else:
+                # corroboration_ratio == 0.0 -> cannot be clean MATCH (anti-hallucination floor)
+                base_verdict = "PARTIAL"
+                reason = "Mapping asserted without deterministic warrant."
+        elif m.mapping_status == "MAPPED" and m.unit_kind == "branch":
+            # Branch unit: code-side guard_text is currently NULL -> stays UNKNOWN
+            base_verdict = "UNKNOWN"
+            reason = "Route exists but the code side carries no guard evidence for this branch outcome."
+        else:
+            base_verdict = "UNKNOWN"
+
+        rec = UnitVerdictRecord(
+            id=record_id,
+            cluster_id=cluster_id,
+            snapshot_id=snapshot_id,
+            unit_id=m.unit_id,
+            unit_kind=m.unit_kind,
+            mapping_status=m.mapping_status,
+            mapping_method=m.mapping_method,
+            route_segment_json=seg_json,
+            verdict=base_verdict,
+            guard_verdict=guard_verdict,
+            ai_bucket=ai_bucket,
+            reason=reason,
+            evidence_json=json.dumps(evidence_dict),
+        )
+        unit_records.append(rec)
+
+        if provider_id and base_verdict in ("MATCH", "PARTIAL", "BROKEN") and ai_bucket != "stale_missing":
+            llm_candidate_units.append({
+                "unit_id": record_id,
+                "bd_claim": {"unit_id": m.unit_id, "kind": m.unit_kind, "reason": m.reason},
+                "code_fact": {"segment_id": m.mapped_segment.segment_id if m.mapped_segment else None, "bindings": m.mapped_segment.bindings if m.mapped_segment else []},
+                "warrant": {"corroboration_ratio": m.corroboration_ratio, "corroborated_bindings": m.corroborated_bindings},
+                "base_verdict": base_verdict,
+                "base_ai_bucket": ai_bucket,
+                "corroboration_ratio": m.corroboration_ratio,
+                "unit_kind": m.unit_kind,
+            })
+
+    # Execute LLM refine pass if candidate units exist and provider_id is passed
+    if provider_id and llm_candidate_units:
+        batches = [
+            llm_candidate_units[i : i + LLM_BATCH_SIZE]
+            for i in range(0, len(llm_candidate_units), LLM_BATCH_SIZE)
+        ]
+        semaphore = asyncio.Semaphore(5)
+        tasks = [_evaluate_llm_batch(b, provider_id, semaphore) for b in batches]
+        batch_results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
+        llm_responses: dict[str, LLMUnitVerdictResponse] = {}
+        for res in batch_results_list:
+            if isinstance(res, dict):
+                llm_responses.update(res)
+            elif isinstance(res, Exception):
+                logger.warning(f"BFI unit verdict LLM batch failed: {res}")
+
+        final_records: list[UnitVerdictRecord] = []
+        cand_by_id = {u["unit_id"]: u for u in llm_candidate_units}
+
+        for rec in unit_records:
+            if rec.id in cand_by_id:
+                cand = cand_by_id[rec.id]
+                llm_res = llm_responses.get(rec.id)
+
+                if llm_res:
+                    if _is_value_comparison_reason(llm_res.reason):
+                        logger.warning(f"Rejected LLM unit verdict for {rec.id}: asserts numeric comparison ('{llm_res.reason}')")
+                        final_records.append(rec)
+                        continue
+
+                    final_verdict = llm_res.verdict
+                    final_bucket = llm_res.ai_bucket or cand["base_ai_bucket"]
+
+                    # Override Floor 1: LLM MATCH cannot override deterministic BROKEN
+                    if cand["base_verdict"] == "BROKEN" and final_verdict == "MATCH":
+                        logger.warning(f"Override floor clamped LLM MATCH to BROKEN for {rec.id}")
+                        final_verdict = "BROKEN"
+                        final_bucket = "stale_missing"
+
+                    # Override Floor 2: corroboration_ratio == 0 cannot be a clean MATCH
+                    if cand["corroboration_ratio"] == 0.0 and final_verdict == "MATCH":
+                        logger.warning(f"Warrant floor clamped LLM MATCH to PARTIAL for un-warranted unit {rec.id}")
+                        final_verdict = "PARTIAL"
+
+                    # Override Floor 3: Branch without code guard evidence stays UNKNOWN
+                    if cand["unit_kind"] == "branch" and final_verdict == "MATCH":
+                        logger.warning(f"Branch guard floor clamped LLM MATCH to UNKNOWN for branch unit {rec.id}")
+                        final_verdict = "UNKNOWN"
+
+                    final_records.append(UnitVerdictRecord(
+                        id=rec.id,
+                        cluster_id=rec.cluster_id,
+                        snapshot_id=rec.snapshot_id,
+                        unit_id=rec.unit_id,
+                        unit_kind=rec.unit_kind,
+                        mapping_status=rec.mapping_status,
+                        mapping_method=rec.mapping_method,
+                        route_segment_json=rec.route_segment_json,
+                        verdict=final_verdict,
+                        guard_verdict=llm_res.guard_verdict or rec.guard_verdict,
+                        ai_bucket=final_bucket,
+                        reason=llm_res.reason,
+                        evidence_json=rec.evidence_json,
+                    ))
+                else:
+                    final_records.append(rec)
+            else:
+                final_records.append(rec)
+
+        unit_records = final_records
+
+    # Persist unit verdicts
+    await db.execute(
+        "DELETE FROM business_unit_verdicts WHERE cluster_id=? AND snapshot_id=?",
+        (cluster_id, snapshot_id),
+    )
+
+    db_tuples = [
+        (
+            ur.id, ur.cluster_id, ur.snapshot_id, ur.unit_id,
+            ur.unit_kind, ur.mapping_status, ur.mapping_method,
+            ur.route_segment_json, ur.verdict, ur.guard_verdict,
+            ur.ai_bucket, ur.reason, ur.evidence_json, ur.comparator_version, utc_now_iso(),
+        )
+        for ur in unit_records
+    ]
+
+    if db_tuples:
+        await db.executemany(
+            "INSERT INTO business_unit_verdicts (id, cluster_id, snapshot_id, unit_id, unit_kind, mapping_status, mapping_method, route_segment_json, verdict, guard_verdict, ai_bucket, reason, evidence_json, comparator_version, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            db_tuples,
+        )
+    await db.commit()
+
+    # Compute Unit Calibration Metrics
+    total_units = len(unit_records)
+    match_cnt = sum(1 for u in unit_records if u.verdict == "MATCH")
+    partial_cnt = sum(1 for u in unit_records if u.verdict == "PARTIAL")
+    broken_cnt = sum(1 for u in unit_records if u.verdict == "BROKEN")
+    unknown_cnt = sum(1 for u in unit_records if u.verdict == "UNKNOWN")
+
+    resolved_units = match_cnt + partial_cnt + broken_cnt
+    match_percentage = (match_cnt / resolved_units * 100.0) if resolved_units > 0 else 100.0
+
+    return UnitVerdictResult(
+        cluster_id=cluster_id,
+        snapshot_id=snapshot_id,
+        verdicts=unit_records,
+        match_percentage=round(match_percentage, 2),
+        total_units=total_units,
+        resolved_units=resolved_units,
+        match_count=match_cnt,
+        partial_count=partial_cnt,
+        broken_count=broken_cnt,
+        unknown_count=unknown_cnt,
+    )
+

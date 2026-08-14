@@ -70,8 +70,12 @@ async def test_executive_summary_deterministic_fallback(tmp_path, monkeypatch):
         # 2. Test Fallback Summary Concrete Examples (TICKET P3-10 FIX 2)
         res = await generate_executive_summary(db, cluster_id, snap_id, provider_id=None)
 
-        assert res["overall_verdict"] == "PASS"
-        assert "calibration is 81.8%" in res["headline"]
+        # P5-REVIEW-FIXES FIX 6: overall_verdict is now clamped deterministically and requires
+        # ZERO broken/contradiction units to PASS — this fixture has 2 real stale_missing
+        # contradictions, so the honest verdict is FAIL even though calibration_pass is True.
+        assert res["overall_verdict"] == "FAIL"
+        # Re-baselined 81.8% -> 83.3% (10/12): the _resolve.py PROGRAM/STEP fix resolves one more program ref.
+        assert "calibration is 83.3%" in res["headline"]
         assert len(res["key_risks"]) >= 2
         # Assert key_risks cites resolved code paths for contradictions
         risks_text = " ".join(res["key_risks"])
@@ -146,7 +150,9 @@ async def test_executive_summary_stubbed_provider(tmp_path, monkeypatch):
 
         res = await generate_executive_summary(db, cluster_id, snap_id, provider_id="stub-provider")
 
-        assert res["overall_verdict"] == "PASS"
+        # P5-REVIEW-FIXES FIX 6: overall_verdict is clamped deterministically and overrides the
+        # stubbed LLM's "PASS" — this fixture has 2 real BROKEN contradictions, so FAIL is correct.
+        assert res["overall_verdict"] == "FAIL"
         assert res["headline"] == "Stubbed LLM: Flow integrity calibrated successfully."
 
         assert len(captured_requests) == 1
@@ -169,5 +175,67 @@ async def test_executive_summary_stubbed_provider(tmp_path, monkeypatch):
         assert "PROCEDURE DIVISION" not in user_msg
         assert "COBOL" not in user_msg
 
+    finally:
+        await close_db()
+
+
+# ---------------------------------------------------------------------------
+# TICKET P5-REVIEW-FIXES acceptance tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_overall_verdict_clamped_to_fail_despite_lying_llm(tmp_path, monkeypatch):
+    """FIX 6: calibration FAIL (below pass band + real BROKEN units) but the LLM's own
+    overall_verdict says "PASS" -- the persisted, returned overall_verdict must be the
+    deterministic "FAIL", never the LLM's free-form string."""
+    from domain.business_flow_integrity._summary import load_executive_summary
+    from domain.model_connector.service import ProviderConfigService
+
+    db_dir = tmp_path / "db"
+    db_dir.mkdir()
+    monkeypatch.setenv("CODESPECTRA_DATA_DIR", str(db_dir))
+    await init_db()
+
+    async def lying_stub(self, request):
+        json_resp = (
+            '{"overall_verdict": "PASS", "headline": "Everything is fine.", '
+            '"key_risks": [], "coverage_note": "n/a", "recommendation": "n/a"}'
+        )
+        yield {"type": "content", "text": json_resp}
+
+    monkeypatch.setattr(ProviderConfigService, "chat_stream_events", lying_stub)
+
+    try:
+        db = get_db()
+        cluster_id = f"cluster-{new_id()}"
+        snap_id = f"snap-{new_id()}"
+
+        # 3 MATCH + 2 BROKEN -> match% = 60% (below the 80% pass band) AND broken_count=2>0:
+        # both conditions independently demand FAIL.
+        verdict_tuples = [
+            (f"verdict:{new_id()}", cluster_id, snap_id, f"edge-{i}", "[]", "MATCH", "CLASS_MATCH", None, "ok", "{}", 1, utc_now_iso())
+            for i in range(3)
+        ] + [
+            (f"verdict:{new_id()}", cluster_id, snap_id, f"edge-broken-{i}", "[]", "BROKEN", None, "stale_missing", "contradicted", "{}", 1, utc_now_iso())
+            for i in range(2)
+        ]
+        await db.executemany(
+            "INSERT INTO flow_verdicts (id, cluster_id, snapshot_id, bd_edge_id, code_subpath_json, verdict, guard_verdict, ai_bucket, reason, evidence_json, comparator_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            verdict_tuples,
+        )
+        await db.commit()
+
+        findings = await get_flow_integrity_findings(db, cluster_id, snap_id)
+        assert findings["calibration"]["calibration_pass"] is False
+        assert findings["calibration"]["broken_count"] == 2
+
+        res = await generate_executive_summary(db, cluster_id, snap_id, provider_id="stub-provider")
+        assert res["overall_verdict"] == "FAIL"
+        assert res["headline"] == "Everything is fine."  # LLM's explanation text is kept as-is
+
+        persisted = await load_executive_summary(db, cluster_id, snap_id)
+        assert persisted is not None
+        assert persisted["overall_verdict"] == "FAIL"
     finally:
         await close_db()

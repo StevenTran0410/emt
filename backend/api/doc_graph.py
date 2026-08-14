@@ -178,18 +178,45 @@ async def run_flow_integrity_pipeline(
     from domain.business_flow_integrity import (
         align_bd_to_code,
         build_code_flow,
+        build_evidence_index,
+        build_route_segments,
         get_flow_integrity_findings,
         run_flow_verdicts,
+        run_source_aware_verdicts,
     )
     from infrastructure.db.database import get_db
+    from shared.logger import logger
 
     db = get_db()
     provider_id = body.provider_id if body else None
 
     await build_code_flow(db, snapshot_id)
+    await build_evidence_index(db, snapshot_id)
     await align_bd_to_code(db, cluster_id, snapshot_id)
+
     await run_flow_verdicts(db, cluster_id, snapshot_id, provider_id=provider_id)
-    return await get_flow_integrity_findings(db, cluster_id, snapshot_id)
+
+    # Phase 4 Part 2: route segments + LLM step/branch mapping + unit verdicts
+    await build_route_segments(db, snapshot_id)
+
+    async with db.execute(
+        "SELECT COUNT(*) as c FROM bd_business_flows WHERE cluster_id=?", (cluster_id,)
+    ) as cur:
+        row = await cur.fetchone()
+        has_bf = (row["c"] if row else 0) > 0
+
+    if has_bf:
+        # TICKET P5-3: source-aware verifier replaces the source-blind run_unit_verdicts here.
+        # It calls run_unit_mapping internally (provider_id=None, deterministic only) for the
+        # contradiction floor — don't call run_unit_mapping again.
+        await run_source_aware_verdicts(db, cluster_id, snapshot_id, provider_id=provider_id)
+        # Persist the executive summary during the Run so an LLM-blocked machine reads it back later.
+        from domain.business_flow_integrity import generate_executive_summary
+        await generate_executive_summary(db, cluster_id, snapshot_id, provider_id=provider_id)
+    else:
+        logger.warning(f"Skipping P4-2 unit mapping/verdicts for cluster {cluster_id}: no bd_business_flows found")
+
+    return await get_flow_integrity_findings(db, cluster_id, snapshot_id, provider_id=provider_id)
 
 
 class FlowIntegritySummaryBody(BaseModel):

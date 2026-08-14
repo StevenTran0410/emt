@@ -31,14 +31,23 @@ import {
   HelpCircle,
   Info
 } from 'lucide-react'
-import { applyComponentBandedLayout } from '../graph/layout'
+import { applyComponentBandedLayout, projectBusinessFlowSkeleton } from '../graph/layout'
+import {
+  BUSINESS_VERDICT_COLORS,
+  nodeTypes as bdNodeTypes,
+  edgeTypes as bdEdgeTypes
+} from '../bd-flow'
 import type {
   DocGraphClusterSummary,
   FlowIntegrityMapResponse,
   FlowIntegrityFindingsResponse,
   FlowIntegrityMapNode,
   FlowIntegrityMapEdge,
-  FlowIntegrityFindingRow
+  FlowIntegrityFindingRow,
+  BusinessUnitAnnotation,
+  BusinessFlow,
+  BusinessFlowStep,
+  BusinessFlowBranch
 } from '../../types/electron'
 
 interface LocalRepo {
@@ -130,12 +139,452 @@ function CustomIntegrityNode({ data }: NodeProps): React.ReactElement {
   )
 }
 
+function UnitEvidenceBlock({
+  citations,
+  aspects
+}: {
+  citations?: BusinessUnitAnnotation['citations']
+  aspects?: BusinessUnitAnnotation['aspects']
+}): React.ReactElement | null {
+  const [open, setOpen] = useState(false)
+
+  if (!citations || citations.length === 0) return null
+
+  return (
+    <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 space-y-2">
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-full flex items-center justify-between text-[11px] font-mono text-indigo-400 hover:text-indigo-300 transition-colors"
+      >
+        <span className="flex items-center gap-1.5">
+          <FileCode className="w-3.5 h-3.5" />
+          <span>
+            Source Evidence ({citations.length} citation{citations.length > 1 ? 's' : ''})
+          </span>
+        </span>
+        {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+      </button>
+
+      {open && (
+        <div className="mt-1 space-y-2 pl-2 border-l-2 border-indigo-900/60">
+          {aspects && (
+            <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono text-slate-400 pb-1">
+              {aspects.target_reachable && (
+                <span className="bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800">
+                  Target: <strong className="text-slate-200">{aspects.target_reachable}</strong>
+                </span>
+              )}
+              {aspects.guard_equivalence && (
+                <span className="bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800">
+                  Guard: <strong className="text-slate-200">{aspects.guard_equivalence}</strong>
+                </span>
+              )}
+              {aspects.route_order && (
+                <span className="bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800">
+                  Order: <strong className="text-slate-200">{aspects.route_order}</strong>
+                </span>
+              )}
+              {aspects.negative_modality && (
+                <span className="bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800">
+                  Negative: <strong className="text-slate-200">{aspects.negative_modality}</strong>
+                </span>
+              )}
+            </div>
+          )}
+
+          {citations.map((c, idx) => (
+            <div key={idx} className="space-y-1">
+              <div className="flex items-center gap-1.5 text-[10px] font-mono text-indigo-300 font-semibold">
+                <span>
+                  {c.rel_path}:{c.line_start}-{c.line_end}
+                </span>
+              </div>
+              {c.fetched_text ? (
+                <pre className="bg-slate-950 p-2.5 rounded border border-slate-800/80 font-mono text-[10px] text-slate-200 overflow-x-auto max-h-56 leading-snug whitespace-pre-wrap">
+                  {c.fetched_text}
+                </pre>
+              ) : (
+                <div className="text-[10px] text-slate-500 italic">No source text fetched</div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ElementEvidenceDetail({
+  selectedElement,
+  onClose
+}: {
+  selectedElement: { type: 'node' | 'edge'; data: any; relatedTransitions?: any[] }
+  onClose: () => void
+}): React.ReactElement {
+  const ann: BusinessUnitAnnotation | undefined = selectedElement.data?.annotation
+
+  if (ann) {
+    const verdict = ann.verdict || 'UNKNOWN'
+    const vStyle = VERDICT_STYLES[verdict] || VERDICT_STYLES.UNKNOWN
+    const step = selectedElement.data?.step as BusinessFlowStep | undefined
+    const branch = selectedElement.data?.branch as BusinessFlowBranch | undefined
+
+    return (
+      <div className="space-y-4 text-xs">
+        <div className="flex items-start justify-between gap-2 pb-2 border-b border-slate-800">
+          <div>
+            <span className="font-bold text-indigo-400 text-[10px] uppercase tracking-wider block mb-1">
+              {selectedElement.type === 'edge' ? 'Business Branch Verdict' : 'Business Step Verdict'}
+            </span>
+            <div className="text-sm font-bold text-slate-100">
+              {selectedElement.type === 'node'
+                ? selectedElement.data?.name || step?.name || 'Step'
+                : selectedElement.data?.label || branch?.guard_description || 'Branch'}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className={`px-2.5 py-1 rounded font-bold font-mono text-xs ${vStyle.bg} ${vStyle.text} border ${vStyle.border}`}>
+              {verdict}
+            </span>
+            <button
+              onClick={onClose}
+              className="p-1 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded"
+              title="Close"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+
+        {/* Prose Description */}
+        {(step?.functionality || branch?.guard_description) && (
+          <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1">
+            <div className="flex items-center gap-1.5 text-slate-300 font-medium text-[11px]">
+              <FileText className="w-3.5 h-3.5 text-indigo-400" />
+              <span>Business Functionality</span>
+            </div>
+            <p className="text-[11px] text-slate-300 pl-5 leading-relaxed">
+              {step?.functionality || branch?.guard_description}
+            </p>
+          </div>
+        )}
+
+        {/* Mapped Code Route */}
+        <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 space-y-2">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1.5 text-slate-300 font-medium text-[11px]">
+              <FileCode className="w-3.5 h-3.5 text-blue-400" />
+              <span>Mapped Code Route</span>
+            </div>
+            <div className="flex items-center gap-1 text-[10px]">
+              <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono">
+                {ann.mapping_status}
+              </span>
+              <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 font-mono">
+                {ann.mapping_method}
+              </span>
+            </div>
+          </div>
+
+          {ann.segment && ann.segment.bindings && ann.segment.bindings.length > 0 ? (
+            <div className="space-y-1 pl-5">
+              <div className="text-[11px] font-mono text-blue-300 font-semibold break-all">
+                {ann.segment.bindings.join(' → ')}
+              </div>
+              {ann.segment.rel_paths && ann.segment.rel_paths.length > 0 && (
+                <div className="text-[10px] font-mono text-slate-400 break-all">
+                  {ann.segment.rel_paths.join(' → ')}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="text-[11px] text-slate-400 pl-5 italic">
+              No candidate code route safely associated with this unit.
+            </div>
+          )}
+
+          {ann.reason && (
+            <div className="text-[11px] text-slate-300 bg-slate-900/80 p-2 rounded border border-slate-800/80 mt-1 leading-relaxed">
+              {ann.reason}
+            </div>
+          )}
+        </div>
+
+        {/* Source Evidence (TICKET P5-UI-FIX4): P5 citations + fetched source text, joined from bfi_run_artifacts */}
+        <UnitEvidenceBlock citations={ann.citations} aspects={ann.aspects} />
+
+        {/* Deterministic Warrant & Evidence — P4 warrant field only; P5 units carry no corroboration_ratio, so hide rather than show NaN% */}
+        {ann.evidence && Number.isFinite(ann.evidence.corroboration_ratio) && (
+          <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 space-y-2">
+            <div className="flex items-center justify-between text-[11px]">
+              <span className="text-slate-300 font-medium">Deterministic Warrant Ratio</span>
+              <span className={`font-mono font-bold ${ann.evidence.corroboration_ratio > 0.8 ? 'text-emerald-400' : ann.evidence.corroboration_ratio > 0 ? 'text-amber-400' : 'text-slate-400'}`}>
+                {(ann.evidence.corroboration_ratio * 100).toFixed(0)}% ({ann.evidence.corroboration_ratio})
+              </span>
+            </div>
+
+            {ann.evidence.corroborated_bindings && ann.evidence.corroborated_bindings.length > 0 && (
+              <div className="space-y-1">
+                <span className="text-[10px] text-slate-400 block">Confirmed Bindings:</span>
+                <div className="flex flex-wrap gap-1">
+                  {ann.evidence.corroborated_bindings.map((b, idx) => (
+                    <span key={idx} className="px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-800 text-emerald-300 font-mono text-[10px]">
+                      {b}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {ann.evidence.contradicted_nodes && ann.evidence.contradicted_nodes.length > 0 && (
+              <div className="p-2.5 rounded bg-red-950/70 border border-red-500/40 text-red-300 space-y-1 mt-2">
+                <div className="flex items-center gap-1.5 font-bold text-[11px]">
+                  <AlertTriangle className="w-3.5 h-3.5 text-red-400" />
+                  <span>Contradicted Evidence</span>
+                </div>
+                {ann.evidence.contradicted_nodes.map((cn: any, idx: number) => (
+                  <div key={idx} className="text-[10px] font-mono text-red-200 pl-4">
+                    • BD binding <code className="bg-red-900/60 px-1 rounded">{cn.binding || cn.bd_node_id}</code> contradicts resolved file <code className="bg-red-900/60 px-1 rounded">{cn.rel_path}</code>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // Legacy detail view
+  return (
+    <div className="space-y-4">
+      <div className="flex items-start justify-between gap-2 pb-2 border-b border-slate-800">
+        <div>
+          <span className="font-bold text-indigo-400 text-[10px] uppercase tracking-wider block mb-1">
+            {selectedElement.type === 'edge' ? 'Transition Verdict Evidence' : 'Node Flow Evidence'}
+          </span>
+          {selectedElement.type === 'node' ? (
+            <CleanLabel
+              text={selectedElement.data?.label || selectedElement.data?.id}
+              titleClassName="text-sm font-bold text-slate-100"
+              subClassName="text-xs text-indigo-300 font-mono mt-0.5"
+            />
+          ) : (
+            <div className="text-xs font-semibold text-slate-200">
+              {selectedElement.data?.srcLabel} → {selectedElement.data?.dstLabel}
+            </div>
+          )}
+        </div>
+        <button
+          onClick={onClose}
+          className="p-1 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded"
+          title="Close"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+
+      {selectedElement.type === 'node' && (
+        <div className="space-y-3 text-xs">
+          <div className="flex items-center gap-2">
+            <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-mono text-[10px] uppercase">
+              Kind: {selectedElement.data?.node_kind}
+            </span>
+            {selectedElement.data?.tag && (
+              <span
+                className={`px-2 py-0.5 rounded font-mono text-[10px] font-bold ${
+                  TAG_STYLES[selectedElement.data.tag]?.bg || 'bg-slate-800'
+                } ${TAG_STYLES[selectedElement.data.tag]?.text || 'text-slate-300'}`}
+              >
+                {selectedElement.data.tag}
+              </span>
+            )}
+          </div>
+
+          <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1">
+            <div className="flex items-center gap-1.5 text-slate-300 font-medium">
+              <FileText className="w-3.5 h-3.5 text-amber-400" />
+              <span>Basic Design (BD) Document Evidence</span>
+            </div>
+            <div className="text-[11px] text-slate-400 font-mono pl-5">
+              Lines {selectedElement.data?.doc_line_start || 1}–{selectedElement.data?.doc_line_end || selectedElement.data?.doc_line_start || 1}
+            </div>
+            {selectedElement.data?.binding && (
+              <div className="text-[11px] text-indigo-300 font-mono pl-5">
+                Binding: {selectedElement.data.binding} ({selectedElement.data.binding_type || 'asset'})
+              </div>
+            )}
+          </div>
+
+          {selectedElement.data?.rel_path && (
+            <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1">
+              <div className="flex items-center gap-1.5 text-slate-300 font-medium">
+                <FileCode className="w-3.5 h-3.5 text-blue-400" />
+                <span>Code Graph Resolved File</span>
+              </div>
+              <div className="text-[11px] text-blue-300 font-mono pl-5 break-all">
+                {selectedElement.data.rel_path}
+              </div>
+            </div>
+          )}
+
+          {selectedElement.data?.tag === 'DOC_MATCHED' && (
+            <div className="p-3 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 space-y-1">
+              <div className="flex items-center gap-1.5 font-bold">
+                <CheckCircle className="w-4 h-4 text-emerald-400" />
+                <span>Faithful Abstraction Proof</span>
+              </div>
+              <p className="text-[11px] text-emerald-200/90 pl-5">
+                BD line {selectedElement.data?.doc_line_start || 1} step faithfully abstracts code execution flow at <code className="font-mono bg-emerald-900/60 px-1 rounded">{selectedElement.data?.rel_path}</code>.
+              </p>
+            </div>
+          )}
+
+          {selectedElement.data?.tag === 'DOC_CONTRADICTED' && (
+            <div className="p-3 rounded-lg bg-red-950/70 border border-red-500/50 text-red-300 space-y-1">
+              <div className="flex items-center gap-1.5 font-bold">
+                <AlertTriangle className="w-4 h-4 text-red-400" />
+                <span>Contradiction Proof</span>
+              </div>
+              <p className="text-[11px] text-red-200/90 pl-5 leading-relaxed">
+                BD documents this asset as missing or unresolved at line {selectedElement.data?.doc_line_start || 1}, but the code graph resolves it at <code className="font-mono bg-red-900/60 px-1 rounded">{selectedElement.data?.rel_path}</code> → stale missing contradiction.
+              </p>
+            </div>
+          )}
+
+          {selectedElement.data?.tag === 'CODE_ONLY' && (
+            <div className="p-3 rounded-lg bg-blue-950/70 border border-blue-500/50 text-blue-300 space-y-1">
+              <div className="flex items-center gap-1.5 font-bold">
+                <Info className="w-4 h-4 text-blue-400" />
+                <span>Code Only Asset (Silent Omission)</span>
+              </div>
+              <p className="text-[11px] text-blue-200/90 pl-5 leading-relaxed">
+                Reachable code route <code className="font-mono bg-blue-900/60 px-1 rounded">{selectedElement.data?.rel_path}</code> is entirely omitted from BD documentation.
+              </p>
+            </div>
+          )}
+
+          {(selectedElement.data?.tag === 'UNKNOWN' || selectedElement.data?.tag === 'BD_ONLY') && (
+            <div className="p-3 rounded-lg bg-slate-900/90 border border-slate-700/80 text-slate-300 space-y-1">
+              <div className="flex items-center gap-1.5 font-bold text-amber-400">
+                <HelpCircle className="w-4 h-4 text-amber-400" />
+                <span>Not Evaluable (No Code Source File)</span>
+              </div>
+              <p className="text-[11px] text-slate-300 pl-5 leading-relaxed">
+                BD documents this step, but no matching source file exists in the indexed repository (it is below route altitude — an intra-program step — or points to an external program/dataset that is not part of the shipped source). It cannot be verified against code.
+              </p>
+              {selectedElement.data?.binding && (
+                <div className="text-[11px] text-indigo-300 font-mono pl-5 pt-0.5">
+                  BD references: <code className="bg-slate-950 px-1 rounded">{selectedElement.data.binding}</code>
+                </div>
+              )}
+            </div>
+          )}
+
+          {selectedElement.relatedTransitions && selectedElement.relatedTransitions.length > 0 && (
+            <div className="space-y-2 pt-2 border-t border-slate-800">
+              <div className="font-bold text-slate-300 text-xs">
+                Connected Flow Transitions ({selectedElement.relatedTransitions.length})
+              </div>
+              <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                {selectedElement.relatedTransitions.map((r) => (
+                  <div
+                    key={r.id}
+                    className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1 text-[11px]"
+                  >
+                    <div className="flex items-center justify-between gap-1">
+                      <div className="flex items-center gap-1 text-slate-200 font-medium truncate">
+                        {r.direction === 'outgoing' ? (
+                          <ArrowRight className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                        ) : (
+                          <ArrowLeft className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                        )}
+                        <CleanLabel text={r.otherNodeLabel} titleClassName="truncate" />
+                      </div>
+                      <span
+                        className={`px-1.5 py-0.5 rounded font-mono font-bold text-[10px] ${
+                          VERDICT_STYLES[r.verdict]?.bg || 'bg-slate-800'
+                        } ${VERDICT_STYLES[r.verdict]?.text || 'text-slate-400'}`}
+                      >
+                        {r.verdict}
+                      </span>
+                    </div>
+                    <div className="text-slate-400 text-[10px] pl-4">{r.reason}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {selectedElement.type === 'edge' && (
+        <div className="space-y-3 text-xs">
+          <div className="flex items-center justify-between">
+            <span className="text-slate-400">Verdict:</span>
+            <span
+              className={`px-2.5 py-1 rounded font-bold font-mono text-xs ${
+                VERDICT_STYLES[selectedElement.data?.verdict]?.bg
+              } ${VERDICT_STYLES[selectedElement.data?.verdict]?.text}`}
+            >
+              {selectedElement.data?.verdict}
+            </span>
+          </div>
+
+          {selectedElement.data?.guard_verdict && (
+            <div className="flex items-center justify-between text-slate-400">
+              <span>Guard Verdict:</span>
+              <span className="font-mono text-indigo-300 font-semibold">
+                {selectedElement.data.guard_verdict}
+              </span>
+            </div>
+          )}
+
+          {selectedElement.data?.ai_bucket && (
+            <div className="flex items-center justify-between text-slate-400">
+              <span>AI Bucket:</span>
+              <span className="px-2 py-0.5 rounded bg-purple-950 text-purple-300 font-mono text-[10px]">
+                {selectedElement.data.ai_bucket}
+              </span>
+            </div>
+          )}
+
+          <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1">
+            <div className="text-slate-300 font-medium">BD Span Evidence</div>
+            <div className="text-[11px] text-slate-400 font-mono">
+              Line {selectedElement.data?.doc_line || 1}
+            </div>
+          </div>
+
+          {selectedElement.data?.reason && (
+            <div className="text-slate-300 bg-slate-950 p-2.5 rounded-lg border border-slate-800 text-[11px] leading-relaxed">
+              {selectedElement.data.reason}
+            </div>
+          )}
+
+          {selectedElement.data?.code_subpath && selectedElement.data.code_subpath.length > 0 && (
+            <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1">
+              <div className="text-slate-300 font-medium text-[11px]">Code Route Hops</div>
+              <div className="text-[10px] font-mono text-blue-300 max-h-24 overflow-y-auto space-y-0.5">
+                {selectedElement.data.code_subpath.map((hop: string, idx: number) => (
+                  <div key={idx}>• {hop}</div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function FlowIntegrityScreen(): React.ReactElement {
   const navigate = useNavigate()
   const [clusters, setClusters] = useState<DocGraphClusterSummary[]>([])
   const [selectedClusterId, setSelectedClusterId] = useState<string>('')
   const [snapshotId, setSnapshotId] = useState<string>('')
   const [mapData, setMapData] = useState<FlowIntegrityMapResponse | null>(null)
+  const [bdFlowData, setBdFlowData] = useState<any>(null)
   const [findingsData, setFindingsData] = useState<FlowIntegrityFindingsResponse | null>(null)
   const [loading, setLoading] = useState<boolean>(false)
   const [running, setRunning] = useState<boolean>(false)
@@ -151,6 +600,12 @@ export function FlowIntegrityScreen(): React.ReactElement {
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
+
+  const hasBusinessFlows = Boolean(
+    mapData?.business_flows_present &&
+    bdFlowData?.business_flows &&
+    bdFlowData.business_flows.length > 0
+  )
 
   // Load available clusters & providers
   useEffect(() => {
@@ -175,7 +630,7 @@ export function FlowIntegrityScreen(): React.ReactElement {
     })
   }, [])
 
-  // Fetch map & findings data when cluster/snapshot selection changes (FIX 1: guard against empty snapshot)
+  // Fetch map, findings & bdFlow data when cluster/snapshot selection changes
   const loadData = useCallback(async () => {
     if (!selectedClusterId) return
     const c = clusters.find((x) => x.cluster_id === selectedClusterId)
@@ -185,13 +640,15 @@ export function FlowIntegrityScreen(): React.ReactElement {
 
     setLoading(true)
     try {
-      const [m, f] = await Promise.all([
+      const [m, f, bd] = await Promise.all([
         window.api?.docGraph?.flowIntegrityGetMap?.(selectedClusterId, snap),
-        window.api?.docGraph?.flowIntegrityGetFindings?.(selectedClusterId, snap)
+        window.api?.docGraph?.flowIntegrityGetFindings?.(selectedClusterId, snap),
+        window.api?.docGraph?.bdFlowGet?.(selectedClusterId)
       ])
 
       setMapData(m)
       setFindingsData(f)
+      setBdFlowData(bd)
     } catch (e) {
       console.error('Failed to load flow integrity data:', e)
     } finally {
@@ -205,9 +662,58 @@ export function FlowIntegrityScreen(): React.ReactElement {
     }
   }, [selectedClusterId, loadData])
 
-  // Build + lay out graph with component Y-banding in rankdir LR (FIX 3)
+  // Build + lay out graph: Business Flow Skeleton (P4-3) or Component Banded Fallback
   useEffect(() => {
-    if (!mapData?.nodes || !mapData?.edges) {
+    if (!mapData) {
+      setNodes([])
+      setEdges([])
+      return
+    }
+
+    if (hasBusinessFlows) {
+      const skeleton = projectBusinessFlowSkeleton(bdFlowData.business_flows)
+      const unitAnnotations: Record<string, BusinessUnitAnnotation> = mapData.unit_annotations || {}
+
+      const decoratedNodes = skeleton.nodes.map((n) => {
+        if (n.type === 'businessStep') {
+          const ann = unitAnnotations[n.id]
+          const verdict = ann?.verdict || 'UNKNOWN'
+          const isDimmed = !showUnknownMap && verdict === 'UNKNOWN'
+          return {
+            ...n,
+            style: isDimmed ? { ...n.style, opacity: 0.45 } : n.style,
+            data: {
+              ...n.data,
+              verdict,
+              annotation: ann
+            }
+          }
+        }
+        return n
+      })
+
+      const decoratedEdges = skeleton.edges.map((e) => {
+        const ann = unitAnnotations[e.id]
+        const verdict = ann?.verdict || 'UNKNOWN'
+        const isDimmed = !showUnknownMap && verdict === 'UNKNOWN'
+        return {
+          ...e,
+          style: isDimmed ? { ...e.style, opacity: 0.45 } : e.style,
+          data: {
+            ...e.data,
+            verdict,
+            annotation: ann
+          }
+        }
+      })
+
+      setNodes(decoratedNodes)
+      setEdges(decoratedEdges)
+      return
+    }
+
+    // Fallback: Legacy merged graph layout
+    if (!mapData.nodes || !mapData.edges) {
       setNodes([])
       setEdges([])
       return
@@ -299,7 +805,7 @@ export function FlowIntegrityScreen(): React.ReactElement {
     })
     setNodes(layoutNodes)
     setEdges(rawEdges)
-  }, [mapData, showUnknownMap, setNodes, setEdges])
+  }, [mapData, bdFlowData, showUnknownMap, hasBusinessFlows, setNodes, setEdges])
 
   const handleRunPipeline = async () => {
     if (!selectedClusterId) return
@@ -325,7 +831,20 @@ export function FlowIntegrityScreen(): React.ReactElement {
     }
   }
 
-  const nodeTypes = useMemo(() => ({ integrityNode: CustomIntegrityNode }), [])
+  const nodeTypes = useMemo(
+    () => ({
+      ...bdNodeTypes,
+      integrityNode: CustomIntegrityNode
+    }),
+    []
+  )
+
+  const edgeTypes = useMemo(
+    () => ({
+      ...bdEdgeTypes
+    }),
+    []
+  )
 
   // Rich evidence on click (FIX 2)
   const onNodeClick = useCallback(
@@ -386,6 +905,10 @@ export function FlowIntegrityScreen(): React.ReactElement {
   )
 
   const cal = findingsData?.calibration
+  // TICKET P5-UI: honest coverage = match_count/total_units. cal.match_percentage is computed over
+  // cal.resolved_units only (excludes UNKNOWN units from the denominator), which overstates real
+  // coverage badly (e.g. 83% of 12 resolved vs the true 19.4% of all 170 units) — do not use it here.
+  const honestCoveragePct = cal && cal.total_units > 0 ? (cal.match_count / cal.total_units) * 100 : 0
 
   return (
     <div className="flex flex-col h-full bg-slate-950 text-slate-100 overflow-hidden">
@@ -492,17 +1015,11 @@ export function FlowIntegrityScreen(): React.ReactElement {
       {cal && (
         <div className="px-4 py-2.5 bg-slate-900/90 border-b border-slate-800 flex flex-wrap items-center justify-between gap-4 text-xs shrink-0">
           <div className="flex items-center gap-3">
-            <span
-              className={`px-2.5 py-1 rounded font-bold font-mono text-xs ${
-                cal.calibration_pass
-                  ? 'bg-emerald-950 text-emerald-400 border border-emerald-500/50'
-                  : 'bg-red-950 text-red-400 border border-red-500/50'
-              }`}
-            >
-              CALIBRATION: {cal.calibration_pass ? 'PASS (80–100%)' : 'FAIL (<80% or 100%)'}
+            <span className="px-2.5 py-1 rounded font-bold font-mono text-xs bg-slate-800 text-slate-200 border border-slate-700">
+              COVERAGE
             </span>
             <span className="text-slate-300 font-mono">
-              Match: <strong className="text-emerald-400">{cal.match_percentage}%</strong> ({cal.match_count}/{cal.resolved_units} resolved units)
+              Backed: <strong className="text-emerald-400">{honestCoveragePct.toFixed(1)}%</strong> ({cal.match_count}/{cal.total_units} units)
             </span>
           </div>
 
@@ -524,6 +1041,12 @@ export function FlowIntegrityScreen(): React.ReactElement {
       <div className="flex-1 flex min-h-0 relative">
           {/* Map Container */}
           <div className="flex-1 h-full bg-slate-950 relative">
+            {!hasBusinessFlows && mapData && (
+              <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 px-3.5 py-1.5 rounded-full bg-slate-900/95 border border-slate-700/80 text-slate-300 text-xs shadow-lg backdrop-blur-md flex items-center gap-2">
+                <Info className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                <span>Business-flow skeleton not built for this cluster — showing detailed graph.</span>
+              </div>
+            )}
             <ReactFlow
               nodes={nodes}
               edges={edges}
@@ -532,6 +1055,7 @@ export function FlowIntegrityScreen(): React.ReactElement {
               onNodeClick={onNodeClick}
               onEdgeClick={onEdgeClick}
               nodeTypes={nodeTypes}
+              edgeTypes={edgeTypes}
               fitView
               className="bg-slate-950"
             >
@@ -565,231 +1089,10 @@ export function FlowIntegrityScreen(): React.ReactElement {
             {/* Primary Section: Node / Edge Evidence Panel (FIX 2) */}
             <div className="flex-1 overflow-y-auto p-4 space-y-4 border-b border-slate-800">
               {selectedElement ? (
-                <div className="space-y-4">
-                  <div className="flex items-start justify-between gap-2 pb-2 border-b border-slate-800">
-                    <div>
-                      <span className="font-bold text-indigo-400 text-[10px] uppercase tracking-wider block mb-1">
-                        {selectedElement.type === 'edge' ? 'Transition Verdict Evidence' : 'Node Flow Evidence'}
-                      </span>
-                      {selectedElement.type === 'node' ? (
-                        <CleanLabel
-                          text={selectedElement.data?.label || selectedElement.data?.id}
-                          titleClassName="text-sm font-bold text-slate-100"
-                          subClassName="text-xs text-indigo-300 font-mono mt-0.5"
-                        />
-                      ) : (
-                        <div className="text-xs font-semibold text-slate-200">
-                          {selectedElement.data?.srcLabel} → {selectedElement.data?.dstLabel}
-                        </div>
-                      )}
-                    </div>
-                    <button
-                      onClick={() => setSelectedElement(null)}
-                      className="p-1 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded"
-                      title="Close"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-
-                  {/* Node Evidence Detail View */}
-                  {selectedElement.type === 'node' && (
-                    <div className="space-y-3 text-xs">
-                      {/* Node Kind & Tag */}
-                      <div className="flex items-center gap-2">
-                        <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-mono text-[10px] uppercase">
-                          Kind: {selectedElement.data?.node_kind}
-                        </span>
-                        {selectedElement.data?.tag && (
-                          <span
-                            className={`px-2 py-0.5 rounded font-mono text-[10px] font-bold ${
-                              TAG_STYLES[selectedElement.data.tag]?.bg || 'bg-slate-800'
-                            } ${TAG_STYLES[selectedElement.data.tag]?.text || 'text-slate-300'}`}
-                          >
-                            {selectedElement.data.tag}
-                          </span>
-                        )}
-                      </div>
-
-                      {/* BD Evidence Row */}
-                      <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1">
-                        <div className="flex items-center gap-1.5 text-slate-300 font-medium">
-                          <FileText className="w-3.5 h-3.5 text-amber-400" />
-                          <span>Basic Design (BD) Document Evidence</span>
-                        </div>
-                        <div className="text-[11px] text-slate-400 font-mono pl-5">
-                          Lines {selectedElement.data?.doc_line_start || 1}–{selectedElement.data?.doc_line_end || selectedElement.data?.doc_line_start || 1}
-                        </div>
-                        {selectedElement.data?.binding && (
-                          <div className="text-[11px] text-indigo-300 font-mono pl-5">
-                            Binding: {selectedElement.data.binding} ({selectedElement.data.binding_type || 'asset'})
-                          </div>
-                        )}
-                      </div>
-
-                      {/* Code Evidence Row */}
-                      {selectedElement.data?.rel_path && (
-                        <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1">
-                          <div className="flex items-center gap-1.5 text-slate-300 font-medium">
-                            <FileCode className="w-3.5 h-3.5 text-blue-400" />
-                            <span>Code Graph Resolved File</span>
-                          </div>
-                          <div className="text-[11px] text-blue-300 font-mono pl-5 break-all">
-                            {selectedElement.data.rel_path}
-                          </div>
-                        </div>
-                      )}
-
-                      {/* Proof Verdict Block */}
-                      {selectedElement.data?.tag === 'DOC_MATCHED' && (
-                        <div className="p-3 rounded-lg bg-emerald-950/60 border border-emerald-500/40 text-emerald-300 space-y-1">
-                          <div className="flex items-center gap-1.5 font-bold">
-                            <CheckCircle className="w-4 h-4 text-emerald-400" />
-                            <span>Faithful Abstraction Proof</span>
-                          </div>
-                          <p className="text-[11px] text-emerald-200/90 pl-5">
-                            BD line {selectedElement.data?.doc_line_start || 1} step faithfully abstracts code execution flow at <code className="font-mono bg-emerald-900/60 px-1 rounded">{selectedElement.data?.rel_path}</code>.
-                          </p>
-                        </div>
-                      )}
-
-                      {selectedElement.data?.tag === 'DOC_CONTRADICTED' && (
-                        <div className="p-3 rounded-lg bg-red-950/70 border border-red-500/50 text-red-300 space-y-1">
-                          <div className="flex items-center gap-1.5 font-bold">
-                            <AlertTriangle className="w-4 h-4 text-red-400" />
-                            <span>Contradiction Proof</span>
-                          </div>
-                          <p className="text-[11px] text-red-200/90 pl-5 leading-relaxed">
-                            BD documents this asset as missing or unresolved at line {selectedElement.data?.doc_line_start || 1}, but the code graph resolves it at <code className="font-mono bg-red-900/60 px-1 rounded">{selectedElement.data?.rel_path}</code> → stale missing contradiction.
-                          </p>
-                        </div>
-                      )}
-
-                      {selectedElement.data?.tag === 'CODE_ONLY' && (
-                        <div className="p-3 rounded-lg bg-blue-950/70 border border-blue-500/50 text-blue-300 space-y-1">
-                          <div className="flex items-center gap-1.5 font-bold">
-                            <Info className="w-4 h-4 text-blue-400" />
-                            <span>Code Only Asset (Silent Omission)</span>
-                          </div>
-                          <p className="text-[11px] text-blue-200/90 pl-5 leading-relaxed">
-                            Reachable code route <code className="font-mono bg-blue-900/60 px-1 rounded">{selectedElement.data?.rel_path}</code> is entirely omitted from BD documentation.
-                          </p>
-                        </div>
-                      )}
-
-                      {(selectedElement.data?.tag === 'UNKNOWN' || selectedElement.data?.tag === 'BD_ONLY') && (
-                        <div className="p-3 rounded-lg bg-slate-900/90 border border-slate-700/80 text-slate-300 space-y-1">
-                          <div className="flex items-center gap-1.5 font-bold text-amber-400">
-                            <HelpCircle className="w-4 h-4 text-amber-400" />
-                            <span>Not Evaluable (No Code Source File)</span>
-                          </div>
-                          <p className="text-[11px] text-slate-300 pl-5 leading-relaxed">
-                            BD documents this step, but no matching source file exists in the indexed repository (it is below route altitude — an intra-program step — or points to an external program/dataset that is not part of the shipped source). It cannot be verified against code.
-                          </p>
-                          {selectedElement.data?.binding && (
-                            <div className="text-[11px] text-indigo-300 font-mono pl-5 pt-0.5">
-                              BD references: <code className="bg-slate-950 px-1 rounded">{selectedElement.data.binding}</code>
-                            </div>
-                          )}
-                        </div>
-                      )}
-
-                      {/* Related Connected Transitions */}
-                      {selectedElement.relatedTransitions && selectedElement.relatedTransitions.length > 0 && (
-                        <div className="space-y-2 pt-2 border-t border-slate-800">
-                          <div className="font-bold text-slate-300 text-xs">
-                            Connected Flow Transitions ({selectedElement.relatedTransitions.length})
-                          </div>
-                          <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
-                            {selectedElement.relatedTransitions.map((r) => (
-                              <div
-                                key={r.id}
-                                className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1 text-[11px]"
-                              >
-                                <div className="flex items-center justify-between gap-1">
-                                  <div className="flex items-center gap-1 text-slate-200 font-medium truncate">
-                                    {r.direction === 'outgoing' ? (
-                                      <ArrowRight className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-                                    ) : (
-                                      <ArrowLeft className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                                    )}
-                                    <CleanLabel text={r.otherNodeLabel} titleClassName="truncate" />
-                                  </div>
-                                  <span
-                                    className={`px-1.5 py-0.5 rounded font-mono font-bold text-[10px] ${
-                                      VERDICT_STYLES[r.verdict]?.bg || 'bg-slate-800'
-                                    } ${VERDICT_STYLES[r.verdict]?.text || 'text-slate-400'}`}
-                                  >
-                                    {r.verdict}
-                                  </span>
-                                </div>
-                                <div className="text-slate-400 text-[10px] pl-4">{r.reason}</div>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {/* Edge Evidence Detail View */}
-                  {selectedElement.type === 'edge' && (
-                    <div className="space-y-3 text-xs">
-                      <div className="flex items-center justify-between">
-                        <span className="text-slate-400">Verdict:</span>
-                        <span
-                          className={`px-2.5 py-1 rounded font-bold font-mono text-xs ${
-                            VERDICT_STYLES[selectedElement.data?.verdict]?.bg
-                          } ${VERDICT_STYLES[selectedElement.data?.verdict]?.text}`}
-                        >
-                          {selectedElement.data?.verdict}
-                        </span>
-                      </div>
-
-                      {selectedElement.data?.guard_verdict && (
-                        <div className="flex items-center justify-between text-slate-400">
-                          <span>Guard Verdict:</span>
-                          <span className="font-mono text-indigo-300 font-semibold">
-                            {selectedElement.data.guard_verdict}
-                          </span>
-                        </div>
-                      )}
-
-                      {selectedElement.data?.ai_bucket && (
-                        <div className="flex items-center justify-between text-slate-400">
-                          <span>AI Bucket:</span>
-                          <span className="px-2 py-0.5 rounded bg-purple-950 text-purple-300 font-mono text-[10px]">
-                            {selectedElement.data.ai_bucket}
-                          </span>
-                        </div>
-                      )}
-
-                      <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1">
-                        <div className="text-slate-300 font-medium">BD Span Evidence</div>
-                        <div className="text-[11px] text-slate-400 font-mono">
-                          Line {selectedElement.data?.doc_line || 1}
-                        </div>
-                      </div>
-
-                      {selectedElement.data?.reason && (
-                        <div className="text-slate-300 bg-slate-950 p-2.5 rounded-lg border border-slate-800 text-[11px] leading-relaxed">
-                          {selectedElement.data.reason}
-                        </div>
-                      )}
-
-                      {selectedElement.data?.code_subpath && selectedElement.data.code_subpath.length > 0 && (
-                        <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-1">
-                          <div className="text-slate-300 font-medium text-[11px]">Code Route Hops</div>
-                          <div className="text-[10px] font-mono text-blue-300 max-h-24 overflow-y-auto space-y-0.5">
-                            {selectedElement.data.code_subpath.map((hop: string, idx: number) => (
-                              <div key={idx}>• {hop}</div>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
+                <ElementEvidenceDetail
+                  selectedElement={selectedElement}
+                  onClose={() => setSelectedElement(null)}
+                />
               ) : (
                 /* Empty State Hint */
                 <div className="h-full flex flex-col items-center justify-center text-center p-6 text-slate-500 space-y-3">

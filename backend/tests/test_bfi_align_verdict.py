@@ -104,9 +104,19 @@ async def test_bfi_alignment_verdict_oracle_hsbmens5(tmp_path, monkeypatch):
                 if cid in code_nodes_path_map
             }
 
-            # PHNIKLOT.clist and HND2UP5J.clist must both be DOC_CONTRADICTED (FIX 3)
-            assert path_tags.get("PHNIKLOT.clist") == "DOC_CONTRADICTED", f"Actual path_tags: {path_tags}"
-            assert path_tags.get("HND2UP5J.clist") == "DOC_CONTRADICTED", f"Actual path_tags: {path_tags}"
+            # PHNIKLOT.clist and HND2UP5J.clist still carry a DOC_CONTRADICTED record (the BD prose
+            # claims them unresolved while the code graph has them) — the stale_missing signal.
+            # Since the _resolve.py fix now also lets a clean reference to the same file resolve
+            # (DOC_MATCHED), the per-path aggregation above may surface DOC_MATCHED; assert directly
+            # on the contradiction record so the stale_missing finding is verified independently of
+            # aggregation order.
+            contradicted_paths = {
+                Path(code_nodes_path_map[r.code_node_id]).name
+                for r in align_res.records
+                if r.code_node_id and r.tag == "DOC_CONTRADICTED" and r.code_node_id in code_nodes_path_map
+            }
+            assert "PHNIKLOT.clist" in contradicted_paths, f"Actual contradicted: {contradicted_paths}"
+            assert "HND2UP5J.clist" in contradicted_paths, f"Actual contradicted: {contradicted_paths}"
 
         # Downstream continuations must be CODE_ONLY
         assert path_tags.get("HNIKLOT.cbl") == "CODE_ONLY"
