@@ -24,18 +24,19 @@ def _make_openrouter_adapter() -> OpenRouterAdapter:
 @pytest.mark.parametrize(
     ("effort", "thinking_budget", "expected_reasoning"),
     [
-        ("none", None, {"enabled": False}),
-        ("disable", None, {"enabled": False}),
-        ("low", None, {"max_tokens": 4000}),
-        ("medium", None, {"max_tokens": 12000}),
-        ("high", None, {"max_tokens": 15000}),   # default judgment tier, kept modest to leave output room
-        ("max", None, {"max_tokens": 30000}),    # reserved for reasoning-heavy calls
-        ("high", 1000, {"max_tokens": 1000}),    # explicit thinking_budget always wins
+        ("none", None, {"effort": "none"}),
+        ("disable", None, {"effort": "none"}),
+        ("low", None, {"effort": "low"}),
+        ("medium", None, {"effort": "medium"}),
+        ("high", None, {"effort": "high"}),
+        ("max", None, {"effort": "max"}),
+        ("high", 1000, {"max_tokens": 1000}),    # explicit thinking_budget still uses the max_tokens form
     ],
 )
 def test_openrouter_payload_reasoning_tier_table(effort, thinking_budget, expected_reasoning):
-    """Bug 2a: 'low'/'medium' must get real (smaller) budgets, not silently fall through to the
-    full cap like 'high' — and an explicit thinking_budget must still win over the tier."""
+    """OpenRouter native reasoning: effort levels go as `reasoning: {effort: <level>}` (per the
+    OpenRouter reasoning-tokens doc — effort OR max_tokens, never both); only an explicit
+    thinking_budget uses the max_tokens form."""
     adapter = _make_openrouter_adapter()
     req = ChatRequest(
         provider_id="p1",

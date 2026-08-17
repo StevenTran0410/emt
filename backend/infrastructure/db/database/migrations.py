@@ -756,7 +756,182 @@ CREATE INDEX IF NOT EXISTS ix_bfart_run  ON bfi_run_artifacts(run_id);
 CREATE INDEX IF NOT EXISTS ix_bfart_unit ON bfi_run_artifacts(snapshot_id, unit_id);
         """,
     },
+    {
+        "version": 15,
+        "description": "Add Phase U user flow alignment tables",
+        "sql": """
+CREATE TABLE IF NOT EXISTS user_flow_docs (
+  id TEXT PRIMARY KEY,
+  source_name TEXT NOT NULL,
+  file_hash TEXT NOT NULL,
+  imported_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_flows (
+  id TEXT PRIMARY KEY,
+  doc_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  name_ja TEXT NOT NULL,
+  name_en TEXT,
+  kind TEXT NOT NULL,            -- 'narrative' | 'case_group'
+  sheet TEXT,
+  scope_note TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_steps (
+  id TEXT PRIMARY KEY,
+  flow_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  kind TEXT NOT NULL,            -- 'action' | 'expectation' | 'error_rule'
+  section_id TEXT,               -- e.g. '2.1⑩' (verbatim)
+  text_ja TEXT NOT NULL,
+  text_en TEXT,
+  trigger_ja TEXT,
+  expected_ja TEXT,
+  screen_name_ja TEXT,
+  in_scope INTEGER NOT NULL DEFAULT 1,
+  scope_note TEXT,
+  sheet TEXT NOT NULL,
+  row_start INTEGER,
+  row_end INTEGER,               -- provenance anchor (like BD doc_line_*)
+  provenance_json TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_cases (
+  id TEXT PRIMARY KEY,
+  doc_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  screen_name_ja TEXT,
+  area_ja TEXT,
+  viewpoint_ja TEXT,
+  conditions_json TEXT,
+  trigger_ja TEXT,
+  check_item_ja TEXT,
+  expected_ja TEXT,
+  link_section_id TEXT,          -- 想定表との紐づけ, verbatim
+  sheet TEXT NOT NULL,
+  row_ix INTEGER,
+  raw_json TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_code_anchors (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  step_id TEXT NOT NULL,
+  rel_path TEXT NOT NULL,
+  line_start INTEGER NOT NULL,
+  line_end INTEGER NOT NULL,
+  kind TEXT NOT NULL,            -- 'seed_literal' | 'llm_matched'
+  valid INTEGER NOT NULL,
+  reason TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_bd_mappings (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  user_step_id TEXT NOT NULL,
+  bd_kind TEXT NOT NULL,         -- 'flow' | 'step' | 'branch'
+  bd_id TEXT NOT NULL,
+  relation TEXT NOT NULL,        -- 'realizes' | 'partial' | 'related'
+  confidence REAL,
+  reason TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_verdicts (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  doc_id TEXT NOT NULL,
+  cluster_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  side TEXT NOT NULL,            -- 'user' | 'bd'
+  ref_id TEXT NOT NULL,
+  ref_kind TEXT NOT NULL,        -- user: 'step'|'case'; bd: 'flow'|'step'|'branch'
+  verdict TEXT NOT NULL,         -- user side: COVERED|BD_MISSING|CONTRADICTED|UNVERIFIABLE|OUT_OF_SCOPE ; bd side: COVERED|BD_EXTRA
+  divergence TEXT,               -- 'scope' | 'behavioural' | NULL
+  reason TEXT,
+  evidence_json TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_case_coverage (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  case_id TEXT NOT NULL,
+  target_kind TEXT NOT NULL,     -- 'code_guard' | 'message_literal'
+  target_ref TEXT NOT NULL,      -- occurrence_id or 'rel_path:line'
+  covered TEXT NOT NULL,         -- 'YES'|'NO'|'PARTIAL'|'UNKNOWN'
+  reason TEXT,
+  evidence_json TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_run_artifacts (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  doc_id TEXT NOT NULL,
+  ref_id TEXT NOT NULL,
+  payload TEXT NOT NULL,         -- APPEND-ONLY audit
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_user_flows_doc ON user_flows(doc_id);
+CREATE INDEX IF NOT EXISTS ix_user_steps_flow ON user_steps(flow_id);
+CREATE INDEX IF NOT EXISTS ix_user_cases_doc ON user_cases(doc_id);
+CREATE INDEX IF NOT EXISTS ix_user_code_anchors_step ON user_code_anchors(step_id);
+CREATE INDEX IF NOT EXISTS ix_user_bd_mappings_step ON user_bd_mappings(user_step_id);
+CREATE INDEX IF NOT EXISTS ix_user_verdicts_scope ON user_verdicts(doc_id, cluster_id, snapshot_id);
+CREATE INDEX IF NOT EXISTS ix_user_case_cov_case ON user_case_coverage(case_id);
+CREATE INDEX IF NOT EXISTS ix_user_run_artifacts_run ON user_run_artifacts(run_id);
+        """,
+    },
+    {
+        "version": 16,
+        "description": "Add Phase U2 user_activities and user_activity_matches tables",
+        "sql": """
+CREATE TABLE IF NOT EXISTS user_activities (
+  id TEXT PRIMARY KEY,
+  flow_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  name_en TEXT NOT NULL,
+  name_ja TEXT,
+  summary_en TEXT,
+  member_step_ids_json TEXT NOT NULL,
+  sheet_span_json TEXT NOT NULL,
+  step_count INTEGER NOT NULL DEFAULT 0,
+  action_count INTEGER NOT NULL DEFAULT 0,
+  error_rule_count INTEGER NOT NULL DEFAULT 0,
+  expectation_count INTEGER NOT NULL DEFAULT 0,
+  row_start INTEGER,
+  row_end INTEGER,
+  origin TEXT NOT NULL DEFAULT 'llm',
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_activity_matches (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  activity_id TEXT NOT NULL,
+  bd_flow_id TEXT,
+  match_status TEXT NOT NULL,
+  confidence REAL,
+  reason TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_user_activities_flow ON user_activities(flow_id);
+CREATE INDEX IF NOT EXISTS ix_user_activity_matches_act ON user_activity_matches(activity_id);
+CREATE INDEX IF NOT EXISTS ix_user_activity_matches_run ON user_activity_matches(run_id);
+        """,
+    },
 ]
 
 TARGET_VERSION = len(_MIGRATIONS) - 1
+
+
 

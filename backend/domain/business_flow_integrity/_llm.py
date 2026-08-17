@@ -52,18 +52,39 @@ def coerce_results_wrapper(parsed: Any) -> Any:
     return parsed
 
 
+async def _resolve_pinned_effort(provider_id: str | None) -> str | None:
+    """If the provider config pins reasoning via extra.default_reasoning_effort, that value wins over
+    the call site's first_effort (the adapter already forces it onto the wire, so the ladder must
+    match it — otherwise the log and retry pretend an effort the provider never actually uses)."""
+    if not provider_id:
+        return None
+    try:
+        cfg = await ProviderConfigService().get_by_id(provider_id)  # masked: no api_key, keeps effort
+        pinned = (cfg.extra or {}).get("default_reasoning_effort")
+        return str(pinned).lower() if pinned else None
+    except Exception:
+        return None
+
+
 async def call_with_reasoning_ladder(
     build_request: Callable[[str], ChatRequest],
     parse: Callable[[str], T],
     *,
     first_effort: str,
     label: str,
+    provider_id: str | None = None,
 ) -> tuple[T, str] | None:
-    """Stream a chat call built at `first_effort`; on empty content or a `parse` failure (ValueError
-    or pydantic ValidationError), retry exactly once at reasoning_effort='low'. Returns
-    (parsed_result, raw_text) on success, else None so the caller applies its own deterministic
-    fallback. Never caches anything itself — a failed attempt is simply discarded, never persisted."""
-    for attempt, effort in enumerate((first_effort, RETRY_EFFORT)):
+    """Stream a chat call; on empty content or a `parse` failure (ValueError or pydantic
+    ValidationError), retry exactly once. Returns (parsed_result, raw_text) on success, else None so
+    the caller applies its own deterministic fallback. Never caches anything itself — a failed attempt
+    is simply discarded, never persisted.
+
+    Effort ladder: if the provider pins extra.default_reasoning_effort, both attempts run at that
+    pinned tier (the adapter forces it anyway). Otherwise the call site's `first_effort` opens and the
+    retry drops to 'low' for extra answer headroom."""
+    pinned = await _resolve_pinned_effort(provider_id)
+    efforts = (pinned, pinned) if pinned else (first_effort, RETRY_EFFORT)
+    for attempt, effort in enumerate(efforts):
         req = build_request(effort)
         full_text = ""
         try:

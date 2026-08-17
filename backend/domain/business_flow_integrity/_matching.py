@@ -62,10 +62,15 @@ BD unit.
 Rules:
 1. Use ONLY the given snippets as evidence.
 2. If snippet(s) realize the BD unit, set maps_to_code to true, list short atomic subclaims describing what is \
-matched, and cite LOCATIONS ONLY (rel_path + line_start + line_end) where the behavior is found.
+matched, and cite LOCATIONS ONLY (rel_path + line_start + line_end) where the behavior is found. Examine ALL given \
+snippets before deciding — a later snippet can contradict what an earlier one appears to support.
 3. The system will independently fetch the verbatim text for citations. Citations MUST refer only to locations \
 within the provided snippets.
-4. If no snippet realizes the unit, set maps_to_code to false, empty citations ([]), and provide a reason.
+4. If no snippet realizes the unit, set maps_to_code to false and provide a reason. If you ALSO notice a snippet \
+that CONTRADICTS the unit (a guard, value, or route conflicting with the BD claim), you MUST still cite that \
+location in citations even though maps_to_code stays false, and say in the reason it is CONTRADICTING evidence, \
+not supporting. maps_to_code=false with non-empty citations always means "contradicting", never "supporting" — \
+never suppress a contradicting citation.
 5. Every unit_id given to you MUST appear EXACTLY ONCE in your results.
 6. Respond ONLY in English. Output ONLY a single JSON object with EXACTLY this top-level shape — no wrapper object, \
 no extra keys:

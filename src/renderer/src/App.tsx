@@ -16,6 +16,7 @@ const DocParsingScreen = lazy(() => import('./screens/doc-parsing'))
 const BdFlowScreen = lazy(() => import('./screens/bd-flow').then(m => ({ default: m.BdFlowScreen })))
 const FlowIntegrityReportScreen = lazy(() => import('./screens/flow-integrity-report').then(m => ({ default: m.FlowIntegrityReportScreen })))
 const FlowIntegrityScreen = lazy(() => import('./screens/flow-integrity').then(m => ({ default: m.FlowIntegrityScreen })))
+const UserFlowReportScreen = lazy(() => import('./screens/user-flow-report').then(m => ({ default: m.UserFlowReportScreen })))
 const DocCodeValidationScreen = lazy(() => import('./screens/doc-code-validation').then(m => ({ default: m.DocCodeValidationScreen })))
 const LinkedGraphScreen = lazy(() => import('./screens/linked-graph').then(m => ({ default: m.LinkedGraphScreen })))
 const SettingsScreen = lazy(() => import('./screens/settings'))
@@ -50,6 +51,7 @@ export default function App(): React.ReactElement {
               <Route path="/bd-flow" element={<BdFlowScreen />} />
               <Route path="/flow-integrity" element={<FlowIntegrityReportScreen />} />
               <Route path="/flow-integrity/graph" element={<FlowIntegrityScreen />} />
+              <Route path="/user-flow" element={<UserFlowReportScreen />} />
               <Route path="/doc-code-validation" element={<DocCodeValidationScreen />} />
               <Route path="/linked-graph/*" element={<LinkedGraphScreen />} />
               <Route path="/settings" element={<SettingsScreen />} />

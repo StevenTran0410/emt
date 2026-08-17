@@ -151,6 +151,14 @@ const api = {
     getAssessment: invoke('docCode:getAssessment'),
     linkedGraph: invoke('docCode:linkedGraph')
   },
+  userFlow: {
+    pickFiles: invoke('userFlow:pickFiles'),
+    listDocs: invoke('userFlow:listDocs'),
+    import: invoke('userFlow:import'),
+    run: invoke('userFlow:run'),
+    report: invoke('userFlow:report'),
+    graph: invoke('userFlow:graph')
+  },
   query: {
     exportCsv: invoke('query:exportCsv')
   },

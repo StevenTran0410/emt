@@ -57,8 +57,14 @@ filenames not in the manifest.
 any missing backing files justified by the unit's prose/label/binding.
 4. If the unit describes a screen, menu, or panel and a .pfd or .ipf file of that name IS in the manifest, that panel \
 file itself is the backing file — confirm it. Do NOT set no_file merely because no program "loads" the panel.
-5. Only set no_file to true when the unit describes a genuinely EXTERNAL system, a dataset/library name, or an \
-abstract capability with no backing file in the manifest. Give a clear reason.
+5. no_file=true is a STRONG factual claim ("no manifest file backs this") — use it RARELY and only with high \
+confidence: the binding names a genuinely EXTERNAL system or a dataset/library AND no panel or program in the \
+manifest plausibly realizes the described behavior. A placeholder / sentinel binding (e.g. '?'), or prose about \
+screen / menu / validation / routing / error-handling logic, is NOT grounds for no_file — that behavior is backed \
+by the owning panel or program file. When you cannot confirm a specific file but are not certain none exists, \
+do NOT assert no_file=true: return confirmed_rel_paths equal to the given seed_rel_paths UNCHANGED (or the panel / \
+program file that plausibly backs the unit) with no_file=false, and explain the uncertainty. A non-empty seed is \
+itself evidence AGAINST no_file — never drop it just because the prose sounds abstract. Give a clear reason.
 6. Output ONLY a single JSON object with EXACTLY this top-level shape — no wrapper object, no extra keys:
 {
   "results": [

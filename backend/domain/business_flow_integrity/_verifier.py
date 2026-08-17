@@ -33,7 +33,7 @@ from ._resolve import resolve_asset
 from ._retrieval import Snippet, expand_unit_snippets, retrieve_unit_snippets
 
 # Bump on any change to prompts or response schemas — stored in every artifact.
-PROMPT_VERSION = "p6-fix-corrector-v1"
+PROMPT_VERSION = "p6-prompt-hardening-v2"
 
 _BATCH_SIZE = 5
 
@@ -84,6 +84,8 @@ Treat `matcher_proposal` as an unverified HYPOTHESIS, never as truth. Re-judge i
 over-claimed a MATCH, or MISSED a snippet that CONTRADICTS the BD (e.g. a menu option / guard / route that maps \
 differently than the BD states) — you must CORRECT it: emit your own verdict with your OWN citations.
 (c) If `maps_to_code` is false but a snippet DOES realize or DOES contradict the unit, override it.
+(d) If `matcher_proposal.maps_to_code` is false but its `citations` list is NOT empty, treat those citations as \
+the matcher's flagged CONTRADICTING evidence (not supporting) and inspect them first.
 Your verdict is final. Citations MUST point only inside the provided snippets; the system re-fetches the verbatim \
 bytes and rejects anything outside the shown window.
 
@@ -97,6 +99,26 @@ evidence is ALWAYS INSUFFICIENT, never NO.
  - NO = the snippet AFFIRMATIVELY shows the code doing something DIFFERENT from, or contradictory to, the BD \
 claim (the guard tests a different condition, control routes to a different target, or the BD says X does not \
 happen but the snippet shows it does).
+ - SCAN the ENTIRE provided window before concluding YES or MATCH — do not stop at the first supporting snippet. \
+Before treating a conflict as evidence against THIS unit, check it sits in the SAME code construct (see \
+ENUMERATED GUARDS below) — a conflict in a visibly separate construct or target may belong to a different BD \
+unit you were not shown.
+
+ENUMERATED GUARDS — the most common source of instability: when the BD guard lists specific values (e.g. \
+"option is 1, 2, or 4"), do NOT judge guard_equivalence by checking only whether the BD's own listed values are \
+valid in the code — that one-directional reading misses real contradictions. Check membership in BOTH \
+directions, but SCOPED to the SAME code construct that realizes this branch (the same EVALUATE/WHEN block, the \
+same dispatch table row-set, the same IF/ELSE chain) — not any occurrence of a value elsewhere in the window, \
+which may belong to a sibling BD branch you were not shown. Only count values in the GUARD/DISPATCH POSITION of \
+that construct (a WHEN/IF condition operand, a table key column) — never incidental numbers (PIC lengths, \
+line/column numbers, unrelated literals):
+ - values that SAME construct accepts which the BD guard never lists, and
+ - values the BD guard lists which that SAME construct does not accept.
+A same-construct discrepancy sets guard_equivalence = NO (cite the differing line). Then decide the VERDICT by \
+confidence: BROKEN only when the unit's own prose is exclusive/exhaustive ("only", "must be", "the valid options \
+are", or a guard stated with no other case implied) OR the extra value is routed to the SAME KIND of outcome as \
+this branch's own target; otherwise PARTIAL, and say in `reason` that the discrepancy may belong to a branch you \
+were not shown.
 
 Rules:
 1. Use ONLY the given snippets as evidence.
@@ -106,20 +128,28 @@ quote from the pinned file; do not paraphrase or invent quoted text in a citatio
 applying the absent-vs-contradicted rule above:
    - target_reachable: YES = a snippet shows the target program/step being invoked/reached; NO = a snippet shows \
 a DIFFERENT target reached instead; INSUFFICIENT = the invocation is not shown either way.
-   - guard_equivalence: YES = the guard in the snippet matches the BD guard class (e.g. success vs error, same \
-option set); NO = the snippet's guard tests a MATERIALLY DIFFERENT condition than the BD; INSUFFICIENT = the \
-guard is not present in the snippet; NOT_APPLICABLE = the unit has no guard.
+   - guard_equivalence: for an enumerated/list guard, compare the BD's listed values against the SAME code \
+construct's actual accepted values, in BOTH directions — see ENUMERATED GUARDS above for the full procedure and \
+the BROKEN-vs-PARTIAL rule. YES = the two sets match (or, for a non-enumerated guard, the guard class matches — \
+e.g. success vs error); NO = the snippet's guard tests a MATERIALLY DIFFERENT condition, OR a same-construct value \
+mismatch per ENUMERATED GUARDS; INSUFFICIENT = the guard is not present in the snippet; NOT_APPLICABLE = the unit \
+has no guard. A one-directional check (verifying only that the BD's own values are valid in code) is NEVER \
+sufficient by itself.
    - route_order: YES = order shown is consistent with the BD; NO = the snippet shows a CONFLICTING order; \
 INSUFFICIENT = order is not observable in the snippet.
    - negative_modality: only when the BD asserts something does NOT happen — YES = the snippet supports that \
 negative claim; NO = the snippet shows that thing DOES happen; NOT_APPLICABLE = the BD makes no negative claim.
 4. Choose the verdict — EXACTLY one of "MATCH", "PARTIAL", "BROKEN", "INSUFFICIENT_EVIDENCE":
    - MATCH: real snippet support with a valid citation and no aspect judged NO.
-   - BROKEN: ONLY when a snippet POSITIVELY contradicts the BD — that means guard_equivalence = NO or \
-negative_modality = NO. NEVER output BROKEN merely because the claimed behavior is absent from the snippet — \
-that is INSUFFICIENT_EVIDENCE.
+   - BROKEN: when a snippet POSITIVELY contradicts the BD — guard_equivalence = NO or negative_modality = NO — \
+AND, for an enumerated-guard discrepancy, ENUMERATED GUARDS above says it is a direct contradiction of THIS \
+unit's own claim (exclusive/exhaustive BD wording, or same-kind outcome), not a discrepancy that might belong to \
+a branch you were not shown. NEVER output BROKEN merely because the claimed behavior is absent — that is \
+INSUFFICIENT_EVIDENCE. NEVER output BROKEN for an enumerated-guard discrepancy you are not confident is this \
+unit's own contradiction — use PARTIAL.
    - INSUFFICIENT_EVIDENCE: the snippets neither confirm nor contradict the claim. Prefer this over guessing.
-   - PARTIAL: partially supported but incomplete.
+   - PARTIAL: partially supported but incomplete — this INCLUDES a same-construct enumerated-guard discrepancy \
+(guard_equivalence = NO) you cannot confidently attribute to THIS branch rather than a sibling branch not shown.
    YES / NO / INSUFFICIENT / NOT_APPLICABLE are ONLY aspect values — NEVER put YES, NO, NO_MATCH, or any aspect \
 value in the `verdict` field.
 5. Every unit_id given to you MUST appear EXACTLY ONCE in your results — no omissions, no duplicates, no extra ids.

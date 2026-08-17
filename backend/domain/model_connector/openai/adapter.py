@@ -87,7 +87,9 @@ class OpenAIAdapter(CloudAdapterBase):
         payload: dict = {
             "model": self.config.model_id,
             "messages": [m.model_dump() for m in request.messages],
-            "max_completion_tokens": request.max_completion_tokens,
+            # Hard ceiling: no single call may exceed 25k completion tokens (reasoning + answer),
+            # regardless of the per-stage request value. Keeps cost/latency bounded across the pipeline.
+            "max_completion_tokens": min(request.max_completion_tokens or 25000, 25000),
         }
         mid = (self.config.model_id or "").lower()
         model_rejects_temp = any(mid.startswith(p) for p in self._NO_TEMPERATURE_PREFIXES)
@@ -116,6 +118,19 @@ class OpenAIAdapter(CloudAdapterBase):
         # but NOT by o1/o3/o4/gpt-5 reasoning models.
         if request.json_mode and not model_rejects_temp:
             payload["response_format"] = {"type": "json_object"}
+            # OpenAI's json_object mode hard-rejects (HTTP 400) any request whose input messages do
+            # not contain the literal word "json" — a schema example (`{...}`) alone does NOT satisfy
+            # the check. DeepSeek never enforced this, so prompts that only show a structure slipped by
+            # until we routed to a GPT model. Guarantee the token without disturbing prompts that
+            # already mention JSON.
+            msgs = payload.get("messages") or []
+            if not any(
+                isinstance(m.get("content"), str) and "json" in m["content"].lower() for m in msgs
+            ):
+                for m in reversed(msgs):
+                    if isinstance(m.get("content"), str):
+                        m["content"] += "\n\nRespond with a single valid JSON object."
+                        break
         return payload
 
     async def chat(self, request: ChatRequest) -> ChatResponse:

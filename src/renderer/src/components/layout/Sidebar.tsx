@@ -31,6 +31,7 @@ const NAV_ITEMS = [
   { path: '/doc-parsing', label: 'Document Parsing', icon: FileText },
   { path: '/bd-flow', label: 'BD Flow', icon: Workflow },
   { path: '/flow-integrity', label: 'Flow Integrity', icon: ShieldCheck },
+  { path: '/user-flow', label: 'User Flow ⟷ BD', icon: Workflow },
   { path: '/doc-code-validation', label: 'Doc↔Code Validation', icon: CheckCircle2 },
   { path: '/linked-graph', label: 'Linked Multi-Graph', icon: Network },
   { path: '/search', label: 'Search', icon: Search },

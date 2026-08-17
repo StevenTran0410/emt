@@ -19,6 +19,9 @@ _MIN_REASONING_TOKENS = 256
 # (a 45k thinking budget left only ~5k for output and caused empty completions). "high" is the
 # default judgment tier at 15k; "max" (30k) is reserved for genuinely reasoning-heavy calls.
 _TIER_BUDGETS: dict[str, int] = {"low": 4000, "medium": 12000, "high": 15000, "max": 30000}
+# OpenRouter's native reasoning uses `reasoning: {effort: <level>}` (effort OR max_tokens, never both).
+# Valid effort levels per the OpenRouter reasoning-tokens doc:
+_OR_EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
 
 
 class OpenRouterAdapter(OpenAIAdapter):
@@ -79,11 +82,17 @@ class OpenRouterAdapter(OpenAIAdapter):
         payload.pop("reasoning_effort", None)
         payload.pop("thinking", None)
 
-        effort = (request.reasoning_effort or "").lower()
-        if effort in ("none", "disable", "off"):
-            payload["reasoning"] = {"enabled": False}  # EXPLICIT off only
-        elif request.thinking_budget or effort:
+        # Per-provider override wins over the per-call effort (mirrors the base adapter) — lets us
+        # pin e.g. deepseek-v4-flash to "low" via extra.default_reasoning_effort.
+        effort = ((self.config.extra or {}).get("default_reasoning_effort") or request.reasoning_effort or "").lower()
+        if request.thinking_budget:
+            # Explicit token budget → OpenRouter's max_tokens form (Anthropic/Gemini style).
             payload["reasoning"] = {"max_tokens": self._reasoning_budget(request)}
+        elif effort in ("none", "disable", "off"):
+            payload["reasoning"] = {"effort": "none"}  # disable reasoning
+        elif effort:
+            # OpenRouter native effort level (mutually exclusive with max_tokens).
+            payload["reasoning"] = {"effort": effort if effort in _OR_EFFORTS else "high"}
         chosen = (self.config.extra or {}).get("openrouter_provider")
         if chosen:
             payload["provider"] = {"order": [chosen], "allow_fallbacks": False}

@@ -26,6 +26,7 @@ from api.repo_map import router as repo_map_router
 from api.retrieval import router as retrieval_router
 from api.structural_graph import router as structural_graph_router
 from api.sync import router as sync_router
+from api.user_flow import router as user_flow_router
 from api.workspace import router as workspace_router
 from domain.model_connector.errors import ProviderError, ProviderErrorCode
 from infrastructure.db.database import close_db, init_db
@@ -103,6 +104,7 @@ def create_app() -> FastAPI:
     app.include_router(structural_graph_router, prefix="/api/graph")
     app.include_router(doc_graph_router, prefix="/api/doc-graph")
     app.include_router(doc_code_compare_router, prefix="/api/doc-code")
+    app.include_router(user_flow_router, prefix="/api/user-flow")
     app.include_router(retrieval_router, prefix="/api/retrieval")
     app.include_router(external_router, prefix="/api/external")
 

@@ -318,6 +318,189 @@ export interface FlowIntegrityExecutiveSummary {
   recommendation: string
 }
 
+// ---------------------------------------------------------------------------
+// Phase U: User Flow Alignment Types (TICKET U5)
+// ---------------------------------------------------------------------------
+
+export interface UserFlowCitation {
+  rel_path: string
+  line_start: number
+  line_end: number
+  fetched_text?: string | null
+  valid?: boolean
+}
+
+export interface UserFlowKeptBdMapping {
+  bd_id: string
+  name: string
+  functionality: string
+  bd_kind: string
+  relation: string
+  confidence: number
+  bd_verdict?: string | null
+  reason?: string
+}
+
+export type UserFlowStepVerdict = 'COVERED' | 'BD_MISSING' | 'CONTRADICTED' | 'UNVERIFIABLE' | 'OUT_OF_SCOPE'
+export type UserFlowMatch = 'MATCHED' | 'PARTIAL' | 'DIVERGENT' | 'UNCOVERED' | 'OUT_OF_SCOPE'
+
+export interface UserFlowStepReport {
+  id: string
+  flow_id: string
+  ordinal: number
+  kind: string
+  section_id?: string | null
+  text_en: string
+  text_ja: string
+  trigger_ja?: string | null
+  expected_ja?: string | null
+  screen_name_ja?: string | null
+  in_scope: boolean
+  scope_note?: string | null
+  sheet: string
+  row_start: number
+  row_end: number
+  verdict: UserFlowStepVerdict
+  divergence?: string | null
+  reason?: string
+  corrected?: boolean
+  basis?: string | null
+  citations: UserFlowCitation[]
+  kept_bd_mappings: UserFlowKeptBdMapping[]
+}
+
+export interface UserFlowActivityMatch {
+  bd_flow_id: string
+  name: string
+  description?: string
+}
+
+export interface UserFlowActivityReport {
+  id: string
+  flow_id: string
+  ordinal: number
+  name_en: string
+  name_ja?: string | null
+  summary_en: string
+  member_step_ids: string[]
+  sheet_span: string[]
+  step_count: number
+  action_count: number
+  error_rule_count: number
+  expectation_count: number
+  row_start?: number | null
+  row_end?: number | null
+  origin: string
+  match_status: 'FULLY' | 'PARTIAL' | 'NONE'
+  matched_bd_flows: UserFlowActivityMatch[]
+  activity_match: UserFlowMatch
+  counts: {
+    COVERED: number
+    BD_MISSING: number
+    CONTRADICTED: number
+    UNVERIFIABLE: number
+    OUT_OF_SCOPE: number
+  }
+  reason?: string
+}
+
+export interface UserFlowFlowReport {
+  id: string
+  doc_id: string
+  ordinal: number
+  name_en: string
+  name_ja: string
+  kind: string
+  sheet: string
+  scope_note?: string | null
+  flow_match: UserFlowMatch
+  counts: {
+    COVERED: number
+    BD_MISSING: number
+    CONTRADICTED: number
+    UNVERIFIABLE: number
+    OUT_OF_SCOPE: number
+  }
+  activities?: UserFlowActivityReport[]
+  steps: UserFlowStepReport[]
+}
+
+export interface UserFlowBdExtraItem {
+  bd_id: string
+  name: string
+  functionality: string
+  bd_kind: string
+  verdict: string
+  divergence: string
+  reason: string
+  bd_verdict?: string | null
+}
+
+export interface UserFlowDocInfo {
+  id: string
+  source_name: string
+  file_hash: string
+  imported_at: string
+}
+
+export interface UserFlowSummary {
+  doc_id: string
+  cluster_id: string
+  snapshot_id: string
+  total_flows: number
+  total_activities?: number
+  total_steps: number
+  in_scope_steps: number
+  flow_counts: {
+    MATCHED: number
+    PARTIAL: number
+    DIVERGENT: number
+    UNCOVERED: number
+    OUT_OF_SCOPE: number
+  }
+  activity_counts?: {
+    MATCHED: number
+    PARTIAL: number
+    DIVERGENT: number
+    UNCOVERED: number
+    OUT_OF_SCOPE: number
+  }
+  step_counts: {
+    COVERED: number
+    BD_MISSING: number
+    CONTRADICTED: number
+    UNVERIFIABLE: number
+    OUT_OF_SCOPE: number
+  }
+  bd_extra_count: number
+}
+
+export interface UserFlowReport {
+  doc: UserFlowDocInfo | null
+  summary: UserFlowSummary
+  flows: UserFlowFlowReport[]
+  bd_extra: UserFlowBdExtraItem[]
+}
+
+export interface UserFlowImportResponse {
+  status: string
+  doc_id: string
+}
+
+export interface UserFlowRunResult {
+  doc_id: string
+  cluster_id: string
+  snapshot_id: string
+  run_id: string
+  anchored_steps: number
+  mapped_steps: number
+  step_verdicts_count: number
+  flow_verdicts_count: number
+  bd_extra_count: number
+  total_logical_llm_calls: number
+  total_physical_attempts: number
+}
+
 export interface Workspace {
 
   id: string
@@ -1098,6 +1281,8 @@ export interface BusinessFlowStep {
   source_node_ids: string[]
   doc_line_start?: number | null
   doc_line_end?: number | null
+  section_id?: string | null
+  kind?: string | null
   created_at: string
 }
 
@@ -1125,6 +1310,7 @@ export interface BusinessFlow {
   model_id?: string | null
   created_at: string
   steps: BusinessFlowStep[]
+  leaf_steps?: BusinessFlowStep[]
   branches: BusinessFlowBranch[]
 }
 
@@ -1310,6 +1496,14 @@ declare global {
         assess: (body: { cluster_id: string; snapshot_id: string; provider_id?: string }) => Promise<AiAssessmentResult>
         getAssessment: (params: { cluster_id: string; snapshot_id: string }) => Promise<AiAssessmentResult | null>
         linkedGraph: (params: { cluster_id: string; snapshot_id: string; layers?: string; scope?: string }) => Promise<LinkedGraphResult>
+      }
+      userFlow: {
+        pickFiles: () => Promise<string[]>
+        listDocs: () => Promise<UserFlowDocInfo[]>
+        import: (body: { paths?: string[]; path?: string; provider_id?: string | null }) => Promise<UserFlowImportResponse>
+        run: (body: { doc_id: string; cluster_id: string; snapshot_id: string; provider_id?: string | null }) => Promise<UserFlowRunResult>
+        report: (doc_id: string, cluster_id: string, snapshot_id: string) => Promise<UserFlowReport>
+        graph: (doc_id: string) => Promise<{ business_flows: BusinessFlow[] }>
       }
       query: {
         exportCsv: (csv: string, defaultName: string) => Promise<{ saved: boolean; file_path: string | null }>
