@@ -66,8 +66,8 @@ class FusedBDMapping(BaseModel):
     model_config = ConfigDict(extra="ignore")
     bd_unit_id: str | None = None
     bd_id: str | None = None
-    relation: str = "realizes"  # realizes | partial | related
-    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+    relation: str = "realizes"  # realizes | partial | related | member_of
+    confidence: float = Field(..., ge=0.0, le=1.0)
     reason: str = ""
     support_claim_ids: list[str] = Field(default_factory=list)
 
@@ -146,15 +146,19 @@ Your task is to return TWO INDEPENDENT things for each user step:
    - ONLY set `"presentation": true` (with empty claims) for purely visual/cosmetic presentation aspects (e.g. font size, screen layout, button color) that have no procedural backend code.
 
 2. `bd_mappings`: Links to candidate BD units that correspond to this user step.
+   - `bd_mappings` are semantic judgments comparing the user step text against the candidate catalog. You SHOULD emit bd_mappings even when `claims` is empty (source code citations are corroborating evidence, not a precondition for semantic mapping).
    - `bd_unit_id` (or `bd_id`): The alias of the matching BD candidate (`bd1`, `bd2`...).
    - `relation`:
      * "realizes": Exact match where the BD unit performs the specific business action/rule executed by this user step.
      * "partial": The step performs part of this BD unit's specific flow logic.
-     * "related": Direct, meaningful relationship to the specific BD unit backed by code evidence.
-   - `confidence`: Float 0.0 to 1.0 (strict: only >= 0.70 for realizes, >= 0.60 for partial/related).
-   - `support_claim_ids`: List of `claim_id`s from above that substantiate this BD mapping with code evidence.
-   - ANTI-CATCH-ALL DISCIPLINE (Applies strictly to BD candidate mapping, NOT to code claims):
-     * DO NOT map test parameter permutations, test data values, or condition rows to generic initialization or generic error handler steps as low-confidence catch-alls.
+     * "member_of": Used specifically when the user step represents a specific test/failure instance of a guarded BD branch (e.g. user error case mapping to an ERROR/FAILURE branch). Many distinct user failure cases legitimately map to ONE error branch.
+     * "related": Direct, meaningful semantic relationship to the specific BD unit.
+   - `confidence`: Required float 0.0 to 1.0 (strict: only >= 0.70 for realizes, >= 0.60 for partial/related, >= 0.55 for member_of).
+   - `support_claim_ids`: Optional list of `claim_id`s from above that substantiate this BD mapping with code evidence.
+   - BRANCH-CLASS MATCHING RULES & ANTI-CATCH-ALL DISCIPLINE:
+     * A BD branch is a guarded outcome edge. Match the user step's expected outcome message (e.g. 「前ページは存在しません」) to the branch guard ("No previous page exists.").
+     * Require a shared guard CLASS (same entity/condition/outcome), not merely the same failure polarity.
+     * ANTI-CATCH-ALL DISCIPLINE applies strictly to SUCCESS branches and generic initialization steps. Never map test failure variations onto a SUCCESS branch or unrelated generic step.
      * If no candidate BD unit genuinely corresponds to this user step's specific action, return `bd_mappings: []`. Unmapped steps are normal and expected for missing BD units; NEVER force-map to a generic step.
 
 OUTPUT FORMAT:
@@ -236,8 +240,8 @@ async def evaluate_align_batch(
             {
                 "bd_id": ctx.bd_id_to_alias.get(b.unit_id, b.alias),
                 "bd_kind": b.bd_kind,
-                "name": b.name,
-                "flow_name": b.name if b.bd_kind == "flow" else "",
+                "name": render_bd_candidate_name(b),
+                "flow_name": b.flow_name or (b.name if b.bd_kind == "flow" else ""),
                 "description": b.description or "",
                 "verdict_summary": f"[{b.verdict}] {b.verdict_reason}" if b.verdict else "unverified",
             }
@@ -282,7 +286,7 @@ async def evaluate_align_batch(
     def _parse(text: str) -> list[FusedStepResult]:
         parsed = coerce_results_wrapper(_parse_llm_json(text))
         raw_results = parsed.get("results", []) if isinstance(parsed, dict) else (parsed if isinstance(parsed, list) else [])
-        
+
         step_results: list[FusedStepResult] = []
         for item in raw_results:
             if not isinstance(item, dict):
@@ -347,44 +351,164 @@ async def evaluate_align_batch(
 
 
 # ---------------------------------------------------------------------------
-# Candidate Shortlisting by Shared Code Files
+# Candidate Shortlisting by Shared Code Files & Bilingual Concepts
 # ---------------------------------------------------------------------------
+
+BILINGUAL_CONCEPT_MAP: dict[str, list[str]] = {
+    "送信": ["send", "transmit", "transfer", "dispatch"],
+    "転送": ["transfer", "forward", "transmit"],
+    "出力": ["output", "export", "write", "print"],
+    "起動": ["launch", "start", "execute", "invoke", "trigger"],
+    "バッチ": ["batch", "job"],
+    "指示": ["instruction", "directive", "order"],
+    "エラー": ["error", "failure", "invalid", "exception", "abort"],
+    "異常": ["error", "abnormal", "failure", "invalid"],
+    "初期表示": ["initial display", "initial", "initialize", "load screen", "init"],
+    "メニュー": ["menu", "main menu"],
+    "引張": ["tensile", "tension"],
+    "試験": ["test", "inspection", "trial"],
+    "ロット": ["lot", "batch"],
+    "更新": ["update", "modify", "save"],
+    "取消": ["cancel", "abort", "revoke"],
+    "削除": ["delete", "remove", "clear"],
+    "クリア": ["clear", "reset"],
+    "次頁": ["next page", "next screen"],
+    "次ページ": ["next page", "next screen"],
+    "前頁": ["previous page", "prior page", "prev page"],
+    "前ページ": ["previous page", "prior page", "prev page"],
+    "存在しません": ["does not exist", "not found", "no next page", "no previous page"],
+    "存在しない": ["does not exist", "not found"],
+    "条件": ["condition", "criteria", "parameter"],
+    "入力": ["input", "enter", "entry"],
+    "検証": ["validate", "validation", "verify", "check"],
+    "コンペア": ["compare", "match"],
+    "一致": ["match", "identical", "equal"],
+    "連携": ["integrate", "interface", "link"],
+    "終了": ["terminate", "exit", "end", "quit"],
+}
+
+
+CLOSED_RELATIONS = {"realizes", "partial", "related", "member_of"}
+# Relations that can carry coverage. `related` is deliberately excluded: it marks topical
+# adjacency (and contradiction candidates), never "this BD unit realizes the step".
+COVERAGE_RELATIONS = {"realizes", "partial", "member_of"}
+
+
+def _step_scoring_text(step_dict: dict[str, Any]) -> str:
+    """Concatenate a step's textual fields. Every field is nullable in the DB, so each one is
+    coalesced explicitly — an f-string would inject the literal token "None" into the scorer."""
+    parts = [
+        step_dict.get("text_ja") or "",
+        step_dict.get("text_en") or "",
+        step_dict.get("screen_name_ja") or "",
+        step_dict.get("expected_ja") or "",
+        step_dict.get("trigger_ja") or "",
+    ]
+    return " ".join(p for p in parts if p).strip()
+
+
+def render_bd_candidate_name(unit: BDUnit) -> str:
+    """Branch identity as shown to every LLM stage: kind, owning flow, and the edge it guards."""
+    if unit.bd_kind == "branch":
+        return (
+            f"{unit.name} branch of {unit.flow_name}: "
+            f"{unit.source_step_name or 'Start'} → {unit.target_step_name or 'End'}"
+        )
+    return unit.name
+
+
+def bd_registry_of(ctx: StepAlignContext) -> list[dict[str, Any]]:
+    """Serializable record of the candidate catalog shown to the mapper for one step."""
+    return [
+        {
+            "bd_alias": ctx.bd_id_to_alias.get(u.unit_id, u.alias),
+            "bd_id": u.unit_id,
+            "bd_kind": u.bd_kind,
+            "flow_id": u.flow_id,
+            "name": render_bd_candidate_name(u),
+            "flow_name": u.flow_name,
+            "functionality": u.description or "",
+        }
+        for u in ctx.bd_candidates
+    ]
+
+
+def _ctx_step_text_fields(ctx: StepAlignContext) -> dict[str, Any]:
+    return {
+        "text_ja": ctx.text_ja,
+        "text_en": ctx.text_en,
+        "screen_name_ja": ctx.screen_name_ja,
+        "expected_ja": ctx.expected_ja,
+        "trigger_ja": ctx.trigger_ja,
+    }
+
+
+def _is_non_success_branch(unit: BDUnit) -> bool:
+    return unit.bd_kind == "branch" and (unit.name or "").strip().lower() not in ("success", "normal")
+
+
+def _shares_guard_class(step_dict: dict[str, Any], unit: BDUnit) -> bool:
+    """Deterministic corroboration that a user step and a branch guard describe the SAME guard
+    class (entity/condition/outcome) rather than merely sharing failure polarity.
+
+    Cross-language semantics are the model's job, so this never rejects a mapping — a negative
+    result is recorded as a review flag on the persisted audit. Overlap counts when the step and
+    the guard share a bilingual concept, an identifier token, or a screen/program name.
+    """
+    step_text = _step_scoring_text(step_dict)
+    guard_text = f"{unit.description or ''} {unit.name or ''} {unit.flow_name or ''}"
+    guard_lower = guard_text.lower()
+
+    for jp_term, en_tokens in BILINGUAL_CONCEPT_MAP.items():
+        if jp_term in step_text and any(tok in guard_lower for tok in en_tokens):
+            return True
+
+    step_tokens = {t for t in re.findall(r"[A-Za-z0-9_]{3,}", step_text.upper())}
+    guard_tokens = {t for t in re.findall(r"[A-Za-z0-9_]{3,}", guard_text.upper())}
+    return bool(step_tokens & guard_tokens)
+
 
 def _shortlist_bd_candidates(
     step_dict: dict[str, Any],
     bd_ctx: BDContext,
     step_code_files: set[str],
 ) -> list[BDUnit]:
-    """Select top plausible BD candidate units for a user step, prioritizing shared code files and semantic job/action keywords."""
+    """Select top plausible BD candidate units for a user step (UP3-2 shortlist overhaul).
+
+    - Threshold: <= 30 returns all units.
+    - Cap: top 24 scored units.
+    - Mandatory non-SUCCESS branches sit outside the cap.
+    - Scorer uses bilingual Japanese -> English concept tokens and code file intersections.
+    """
     all_units = bd_ctx.units
-    if len(all_units) <= 15:
+    if len(all_units) <= 30:
         return all_units
 
     step_files_upper = {Path(f).name.upper() for f in step_code_files}
-    step_text = f"{step_dict.get('text_ja', '')} {step_dict.get('text_en', '')} {step_dict.get('screen_name_ja', '')} {step_dict.get('expected_ja', '')} {step_dict.get('trigger_ja', '')}".strip()
+    step_text = _step_scoring_text(step_dict)
     step_text_upper = step_text.upper()
 
-    # Extract alphanumeric identifier tokens (job names, program names, screen names, e.g. HNDM004J, KGFXVMIN, CSV, Linkexpress, FHNIXLOT, HSBMENU5)
+    # Mandatory candidates are decided before scoring and never occupy a scored slot: every
+    # non-SUCCESS branch of the step's tier-1-scoped flows ships regardless of lexical score.
+    mandatory_branches = [u for u in all_units if _is_non_success_branch(u)]
+    mandatory_ids = {u.unit_id for u in mandatory_branches}
+    scorable_units = [u for u in all_units if u.unit_id not in mandatory_ids]
+
+    # Extract alphanumeric identifier tokens
     alphanumeric_tokens = set(re.findall(r'[A-Za-z0-9_]{3,}', step_text_upper))
     for sf in step_files_upper:
         stem = Path(sf).stem.upper()
         if len(stem) >= 3:
             alphanumeric_tokens.add(stem)
 
-    # Key Japanese technical keywords for batch, transfer, screen actions
-    JP_KEYWORDS = [
-        "送信", "転送", "出力", "起動", "バッチ", "ＣＳＶ", "CSV", "指示", "エラー",
-        "初期表示", "メニュー", "引張", "試験", "ロット", "更新", "取消", "削除", "クリア",
-        "次頁", "前頁", "条件", "入力", "検証", "コンペア", "一致", "連携"
-    ]
-    matched_jp_keywords = [kw for kw in JP_KEYWORDS if kw in step_text]
-
     scored: list[tuple[int, BDUnit]] = []
-    for u in all_units:
+    for u in scorable_units:
         score = 0
-        u_desc = f"{u.name} {u.description or ''} {u.verdict_reason or ''} {u.flow_id}".upper()
+        u_reason_str = u.verdict_reason if u.verdict_reason else ""
+        u_desc = f"{u.name} {u.description or ''} {u_reason_str} {u.flow_name or ''} {u.flow_id}".upper()
+        u_desc_lower = u_desc.lower()
 
-        # 1. Primary: shared code file intersection (language-agnostic)
+        # 1. Primary: shared code file intersection
         for sf in step_files_upper:
             if sf in u_desc:
                 score += 12
@@ -392,24 +516,30 @@ def _shortlist_bd_candidates(
             if len(sf_stem) >= 4 and sf_stem in u_desc:
                 score += 8
 
-        # 2. Alphanumeric job / program token match (e.g. HNDM004J, KGFXVMIN, CSV, Linkexpress)
+        # 2. Alphanumeric job / program token match
         for token in alphanumeric_tokens:
             if token in u_desc:
                 score += 15
 
-        # 3. Japanese technical keyword overlap
-        for kw in matched_jp_keywords:
-            if kw.upper() in u_desc:
-                score += 4
+        # 3. Bilingual technical concept token overlap
+        for jp_term, en_tokens in BILINGUAL_CONCEPT_MAP.items():
+            if jp_term in step_text:
+                for en_tok in en_tokens:
+                    if en_tok.lower() in u_desc_lower:
+                        score += 6
 
         scored.append((score, u))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    selected = [u for score, u in scored if score > 0][:12]
-    if not selected:
-        # Fall back to first 12 if no specific code or text overlap found
-        selected = [u for _, u in scored[:12]]
-    return selected if selected else all_units[:12]
+    scored_top = [u for _, u in scored[:24]]
+
+    # Combine the full scored cap with every mandatory branch, preserving order and deduping.
+    selected_map: dict[str, BDUnit] = {}
+    for u in scored_top + mandatory_branches:
+        if u.unit_id not in selected_map:
+            selected_map[u.unit_id] = u
+
+    return list(selected_map.values())
 
 
 # ---------------------------------------------------------------------------
@@ -611,26 +741,46 @@ async def align_user_flow_steps(
                             })
                             continue
 
-                        # Quality Gate: Confidence & evidence thresholds to eliminate catch-all mappings
+                        # Quality Gate: Confidence & relationship validation (UP3-2). `rel` is the
+                        # canonical form and it — not the model's spelling — is what gets persisted,
+                        # so the stored enum stays closed.
+                        rel = (m.relation or "").strip().lower()
                         conf = float(m.confidence or 0.0)
-                        rel = (m.relation or "").lower()
                         has_valid_claim = any(cid in valid_claim_ids for cid in m.support_claim_ids)
                         is_evidence_backed = has_valid_claim and not fused_res.presentation
 
-                        # Threshold requirements:
-                        # - Minimum noise floor: 0.50
-                        # - "realizes": confidence >= 0.70
-                        # - "partial": confidence >= 0.60
-                        # - "related": confidence >= 0.60 AND requires valid claim support
                         is_quality_valid = True
-                        if conf < 0.50:
+                        reject_reason = ""
+
+                        if rel not in CLOSED_RELATIONS:
                             is_quality_valid = False
+                            reject_reason = f"UNKNOWN_RELATION: {rel}"
+                        elif conf < 0.50:
+                            is_quality_valid = False
+                            reject_reason = f"CONFIDENCE_BELOW_MIN_FLOOR: {conf} < 0.50"
                         elif rel == "realizes" and conf < 0.70:
                             is_quality_valid = False
+                            reject_reason = f"REALIZES_BELOW_THRESHOLD: {conf} < 0.70"
                         elif rel == "partial" and conf < 0.60:
                             is_quality_valid = False
-                        elif rel == "related" and (conf < 0.60 or not has_valid_claim):
+                            reject_reason = f"PARTIAL_BELOW_THRESHOLD: {conf} < 0.60"
+                        elif rel == "related" and conf < 0.60:
                             is_quality_valid = False
+                            reject_reason = f"RELATED_BELOW_THRESHOLD: {conf} < 0.60"
+                        elif rel == "member_of":
+                            if not _is_non_success_branch(bd_unit):
+                                is_quality_valid = False
+                                reject_reason = f"MEMBER_OF_FORBIDDEN_ON_TARGET_KIND: {bd_unit.bd_kind}/{bd_unit.name}"
+                            elif conf < 0.55:
+                                is_quality_valid = False
+                                reject_reason = f"MEMBER_OF_BELOW_THRESHOLD: {conf} < 0.55"
+
+                        # Guard-class corroboration: a member_of whose step text shares nothing with
+                        # the branch guard is exactly the spray the prompt forbids, but the judgment
+                        # is cross-language and semantic — flag it for review, never silently accept.
+                        guard_class_flag: str | None = None
+                        if is_quality_valid and rel == "member_of" and not _shares_guard_class(_ctx_step_text_fields(ctx), bd_unit):
+                            guard_class_flag = "UNCORROBORATED_GUARD_CLASS"
 
                         if not is_quality_valid:
                             dropped_mappings.append({
@@ -640,6 +790,7 @@ async def align_user_flow_steps(
                                 "confidence": conf,
                                 "reason": m.reason,
                                 "error": "BELOW_QUALITY_THRESHOLD",
+                                "reject_reason": reject_reason,
                             })
                             continue
 
@@ -655,7 +806,7 @@ async def align_user_flow_steps(
                             ctx.user_step_id,
                             bd_unit.bd_kind,
                             bd_unit.unit_id,
-                            m.relation,
+                            rel,
                             conf,
                             m.reason,
                             now,
@@ -669,11 +820,12 @@ async def align_user_flow_steps(
                             "bd_id": bd_unit.unit_id,
                             "bd_alias": target_alias,
                             "bd_kind": bd_unit.bd_kind,
-                            "relation": m.relation,
+                            "relation": rel,
                             "confidence": conf,
                             "reason": m.reason,
                             "support_claim_ids": m.support_claim_ids,
                             "evidence_backed": is_evidence_backed,
+                            "guard_class_flag": guard_class_flag,
                         })
 
                     # 3. Store Step Audit Artifact
@@ -687,6 +839,10 @@ async def align_user_flow_steps(
                         "dropped_mappings": dropped_mappings,
                         "dropped_unknown_bd_count": len(dropped_mappings),
                         "evidence_backed_mappings_count": step_evidence_backed_count,
+                        # The EXACT candidate registry this step's mapper saw. The verifier reloads
+                        # it verbatim instead of re-deriving a shortlist, so both stages judge the
+                        # same catalog under the same aliases (a prerequisite for safe BD_MISSING).
+                        "bd_registry": bd_registry_of(ctx),
                         "raw_response": raw_resp,
                         "retry_count": retries,
                         "latency_ms": lat,
@@ -814,6 +970,9 @@ async def align_user_flow_steps(
         "evidence_backed_mappings_count": evidence_backed_mappings_count,
         "mapped_user_step_count": len(mapped_step_ids),
         "evidence_backed_mapped_step_count": len(evidence_backed_step_ids),
+        # UP3-2 metrics split: semantic mapping recall is reported separately from code-evidence recall.
+        "semantic_mapped_steps": len(mapped_step_ids),
+        "evidence_backed_steps": len(evidence_backed_step_ids),
         "unmapped_user_step_ids": unmapped_user_steps,
         "unmapped_bd_unit_ids": unmapped_bd_units,
         "bd_unit_counts": bd_unit_counts_summary,
@@ -835,4 +994,4 @@ async def align_user_flow_steps(
     )
 
     await db.commit()
-    return total_valid_anchors, len(evidence_backed_step_ids), run_summary
+    return total_valid_anchors, len(mapped_step_ids), run_summary

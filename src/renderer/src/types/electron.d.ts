@@ -328,6 +328,7 @@ export interface UserFlowCitation {
   line_end: number
   fetched_text?: string | null
   valid?: boolean
+  reason?: string | null
 }
 
 export interface UserFlowKeptBdMapping {
@@ -336,7 +337,12 @@ export interface UserFlowKeptBdMapping {
   functionality: string
   bd_kind: string
   relation: string
-  confidence: number
+  /** null for verifier-added mappings: the verifier asserts the link without scoring it. */
+  confidence: number | null
+  /** false for `related`, which marks adjacency rather than realization. */
+  coverage_bearing?: boolean
+  /** Set when the gate kept a member_of whose guard class nothing corroborates. */
+  guard_class_flag?: string | null
   bd_verdict?: string | null
   reason?: string
 }
@@ -375,6 +381,14 @@ export interface UserFlowActivityMatch {
   description?: string
 }
 
+export interface UserFlowPairMatch {
+  bd_flow_id?: string | null
+  bd_flow_name?: string | null
+  match_status: 'FULLY' | 'PARTIAL' | 'NONE' | 'UNRESOLVED'
+  confidence?: number
+  reason?: string
+}
+
 export interface UserFlowActivityReport {
   id: string
   flow_id: string
@@ -391,8 +405,9 @@ export interface UserFlowActivityReport {
   row_start?: number | null
   row_end?: number | null
   origin: string
-  match_status: 'FULLY' | 'PARTIAL' | 'NONE'
+  match_status: 'FULLY' | 'PARTIAL' | 'NONE' | 'UNRESOLVED'
   matched_bd_flows: UserFlowActivityMatch[]
+  pair_matches?: UserFlowPairMatch[]
   activity_match: UserFlowMatch
   counts: {
     COVERED: number
@@ -414,6 +429,8 @@ export interface UserFlowFlowReport {
   sheet: string
   scope_note?: string | null
   flow_match: UserFlowMatch
+  divergence?: string | null
+  reason?: string
   counts: {
     COVERED: number
     BD_MISSING: number
@@ -428,11 +445,34 @@ export interface UserFlowFlowReport {
 export interface UserFlowBdExtraItem {
   bd_id: string
   name: string
+  flow_id?: string
+  flow_name?: string
   functionality: string
   bd_kind: string
   verdict: string
-  divergence: string
+  divergence?: string | null
   reason: string
+  bd_verdict?: string | null
+}
+
+export interface UserFlowBranchIncomingStep {
+  id: string
+  ordinal: number
+  text_en: string
+  flow_name: string
+}
+
+export interface UserFlowBranchCoverageItem {
+  branch_id: string
+  flow_id: string
+  flow_name: string
+  branch_kind: string
+  guard_description: string
+  incoming_step_count: number
+  incoming_step_ids: string[]
+  incoming_steps?: UserFlowBranchIncomingStep[]
+  parent_tier1_status?: 'FULLY' | 'PARTIAL' | 'UNRESOLVED' | 'NONE'
+  is_user_flow_gap: boolean
   bd_verdict?: string | null
 }
 
@@ -445,6 +485,7 @@ export interface UserFlowDocInfo {
 
 export interface UserFlowSummary {
   doc_id: string
+  run_id?: string | null
   cluster_id: string
   snapshot_id: string
   total_flows: number
@@ -473,13 +514,17 @@ export interface UserFlowSummary {
     OUT_OF_SCOPE: number
   }
   bd_extra_count: number
+  bd_unmapped_count?: number
 }
 
 export interface UserFlowReport {
   doc: UserFlowDocInfo | null
+  run_id?: string | null
   summary: UserFlowSummary
   flows: UserFlowFlowReport[]
   bd_extra: UserFlowBdExtraItem[]
+  bd_unmapped?: UserFlowBdExtraItem[]
+  branch_coverage?: UserFlowBranchCoverageItem[]
 }
 
 export interface UserFlowImportResponse {
@@ -487,18 +532,29 @@ export interface UserFlowImportResponse {
   doc_id: string
 }
 
+/** Mirrors backend `UserFlowRunResult` (backend/domain/user_flow/__init__.py) field for field. */
 export interface UserFlowRunResult {
   doc_id: string
-  cluster_id: string
-  snapshot_id: string
   run_id: string
+  total_steps: number
+  in_scope_steps: number
   anchored_steps: number
+  llm_batches_issued: number
+  /** Legacy alias of semantic_mapped_steps. */
   mapped_steps: number
-  step_verdicts_count: number
-  flow_verdicts_count: number
-  bd_extra_count: number
-  total_logical_llm_calls: number
-  total_physical_attempts: number
+  semantic_mapped_steps: number
+  evidence_backed_steps: number
+  physical_llm_attempts: number
+  import_llm_calls: number
+  total_llm_calls: number
+  activities_total: number
+  matched_fully: number
+  matched_partial: number
+  matched_none: number
+  matched_unresolved: number
+  tier2_steps_run: number
+  tier2_steps_skipped: number
+  status: string
 }
 
 export interface Workspace {

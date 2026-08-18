@@ -91,6 +91,7 @@ async def get_report(
     doc_id: str,
     cluster_id: str,
     snapshot_id: str,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Retrieve full User Flow Alignment report JSON."""
     db = get_db()
@@ -100,6 +101,7 @@ async def get_report(
             doc_id=doc_id,
             cluster_id=cluster_id,
             snapshot_id=snapshot_id,
+            run_id=run_id,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"User flow report query failed: {e}")

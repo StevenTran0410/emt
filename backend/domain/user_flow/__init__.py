@@ -4,6 +4,7 @@ Exports import_user_flow_xlsx and supporting extractors / structurers / aligners
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
@@ -107,6 +108,11 @@ from ._verdict import (
 )
 
 
+# Serializes run finalization: the DB handle is a process-wide singleton, so two runs finalizing
+# at once would interleave their statements (and their commits) on the same connection.
+_RUN_PUBLISH_LOCK = asyncio.Lock()
+
+
 @dataclass
 class UserFlowRunResult:
     doc_id: str
@@ -115,7 +121,9 @@ class UserFlowRunResult:
     in_scope_steps: int
     anchored_steps: int
     llm_batches_issued: int          # real ALIGN logical batch count
-    mapped_steps: int = 0
+    mapped_steps: int = 0             # legacy alias of semantic_mapped_steps
+    semantic_mapped_steps: int = 0    # steps with >=1 kept semantic BD mapping (UP3-2: decoupled from code evidence)
+    evidence_backed_steps: int = 0    # subset whose mapping is backed by a valid code claim
     physical_llm_attempts: int = 0    # align physical provider attempts (incl. ladder retries)
     import_llm_calls: int = 0         # real import-stage logical calls (from the __import_summary__ artifact)
     total_llm_calls: int = 0          # import + align + tier1 + verdict logical calls
@@ -123,6 +131,7 @@ class UserFlowRunResult:
     matched_fully: int = 0
     matched_partial: int = 0
     matched_none: int = 0
+    matched_unresolved: int = 0
     tier2_steps_run: int = 0
     tier2_steps_skipped: int = 0
     status: str = "ok"
@@ -254,7 +263,40 @@ async def import_user_flow_xlsx(
     if existing:
         existing_id = existing[0] if isinstance(existing, (tuple, list)) else existing["id"]
         logger.info("Re-importing user flow doc %s (hash %s)", existing_id, file_hash)
-        await db.execute("DELETE FROM user_steps WHERE flow_id IN (SELECT id FROM user_flows WHERE doc_id = ?)", (existing_id,))
+        # Fetch flow, step, and activity IDs
+        async with db.execute("SELECT id FROM user_flows WHERE doc_id = ?", (existing_id,)) as cur:
+            f_rows = await cur.fetchall()
+        old_flow_ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in f_rows]
+
+        old_step_ids: list[str] = []
+        old_act_ids: list[str] = []
+        if old_flow_ids:
+            f_ph = ",".join("?" for _ in old_flow_ids)
+            async with db.execute(f"SELECT id FROM user_steps WHERE flow_id IN ({f_ph})", old_flow_ids) as cur:
+                s_rows = await cur.fetchall()
+            old_step_ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in s_rows]
+
+            async with db.execute(f"SELECT id FROM user_activities WHERE flow_id IN ({f_ph})", old_flow_ids) as cur:
+                a_rows = await cur.fetchall()
+            old_act_ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in a_rows]
+
+        if old_step_ids:
+            s_ph = ",".join("?" for _ in old_step_ids)
+            await db.execute(f"DELETE FROM user_bd_mappings WHERE user_step_id IN ({s_ph})", old_step_ids)
+            await db.execute(f"DELETE FROM user_code_anchors WHERE step_id IN ({s_ph})", old_step_ids)
+
+        await db.execute("DELETE FROM user_case_coverage WHERE case_id IN (SELECT id FROM user_cases WHERE doc_id = ?)", (existing_id,))
+        await db.execute("DELETE FROM user_verdicts WHERE doc_id = ?", (existing_id,))
+
+        if old_act_ids:
+            a_ph = ",".join("?" for _ in old_act_ids)
+            await db.execute(f"DELETE FROM user_activity_matches WHERE activity_id IN ({a_ph})", old_act_ids)
+
+        if old_flow_ids:
+            f_ph = ",".join("?" for _ in old_flow_ids)
+            await db.execute(f"DELETE FROM user_activities WHERE flow_id IN ({f_ph})", old_flow_ids)
+            await db.execute(f"DELETE FROM user_steps WHERE flow_id IN ({f_ph})", old_flow_ids)
+
         await db.execute("DELETE FROM user_flows WHERE doc_id = ?", (existing_id,))
         await db.execute("DELETE FROM user_cases WHERE doc_id = ?", (existing_id,))
         await db.execute("DELETE FROM user_run_artifacts WHERE doc_id = ?", (existing_id,))
@@ -527,6 +569,77 @@ async def import_user_flow_xlsx(
     return doc_id
 
 
+async def _publish_completed_run(
+    db: Any,
+    *,
+    doc_id: str,
+    cluster_id: str,
+    snapshot_id: str,
+    run_id: str,
+    summary: dict[str, Any],
+) -> None:
+    """Publish a run atomically: write its completion marker and GC superseded runs.
+
+    Two hazards are handled here. (1) The connection is a process-wide singleton, so a marker
+    inserted but not committed rides along on the NEXT unrelated commit — publishing a run whose
+    request actually failed; the savepoint + rollback makes the marker and its GC all-or-nothing.
+    (2) A concurrent run finalizing against the same connection would interleave its statements
+    with ours, so finalization is serialized.
+
+    GC scope: only COMPLETED runs of the SAME (doc, cluster, snapshot), keeping the current run
+    plus one prior. Unmarked runs are never touched — an unmarked run may still be in progress,
+    and one that failed is already invisible to the report by the publication contract. Historical
+    failed-run rows are cleared by the one-time orphan prune (migration 17) instead.
+    """
+    async with _RUN_PUBLISH_LOCK:
+        await db.execute("SAVEPOINT ufrun_publish")
+        try:
+            await db.execute(
+                "INSERT INTO user_run_artifacts (id, run_id, doc_id, ref_id, payload, created_at) "
+                "VALUES (?, ?, ?, '__run_complete__', ?, ?)",
+                (f"ufrunart:{new_id()}", run_id, doc_id, json.dumps(summary), utc_now_iso()),
+            )
+
+            async with db.execute(
+                "SELECT run_id, payload, MAX(created_at) AS max_created_at "
+                "FROM user_run_artifacts "
+                "WHERE doc_id = ? AND ref_id = '__run_complete__' "
+                "GROUP BY run_id "
+                "ORDER BY max_created_at DESC",
+                (doc_id,),
+            ) as cur:
+                completed_rows = await cur.fetchall()
+
+            same_tuple_completed: list[str] = []
+            for r in completed_rows:
+                r_run_id = r[0] if isinstance(r, (tuple, list)) else r["run_id"]
+                r_payload = r[1] if isinstance(r, (tuple, list)) else r["payload"]
+                try:
+                    p = json.loads(r_payload or "{}")
+                except Exception:
+                    p = {}
+                if p.get("cluster_id") == cluster_id and p.get("snapshot_id") == snapshot_id:
+                    same_tuple_completed.append(r_run_id)
+
+            prune_run_ids = [rid for rid in same_tuple_completed[2:] if rid != run_id and rid != doc_id]
+            if prune_run_ids:
+                ph = ",".join("?" for _ in prune_run_ids)
+                await db.execute(f"DELETE FROM user_activity_matches WHERE run_id IN ({ph})", prune_run_ids)
+                await db.execute(f"DELETE FROM user_bd_mappings WHERE run_id IN ({ph})", prune_run_ids)
+                await db.execute(f"DELETE FROM user_code_anchors WHERE run_id IN ({ph})", prune_run_ids)
+                await db.execute(f"DELETE FROM user_verdicts WHERE run_id IN ({ph})", prune_run_ids)
+                await db.execute(f"DELETE FROM user_case_coverage WHERE run_id IN ({ph})", prune_run_ids)
+                await db.execute(f"DELETE FROM user_run_artifacts WHERE run_id IN ({ph})", prune_run_ids)
+
+            await db.execute("RELEASE SAVEPOINT ufrun_publish")
+            await db.commit()
+        except BaseException:
+            # Includes CancelledError: an aborted request must never leave a pending marker behind.
+            await db.execute("ROLLBACK TO SAVEPOINT ufrun_publish")
+            await db.execute("RELEASE SAVEPOINT ufrun_publish")
+            raise
+
+
 async def run_user_flow_alignment(
     db: Any,
     doc_id: str,
@@ -543,21 +656,7 @@ async def run_user_flow_alignment(
 
     local_path = snap_row[0] if isinstance(snap_row, (tuple, list)) else (snap_row["local_path"] if snap_row else "")
 
-    # 2. Clear prior code anchors & BD mappings for this doc_id
-    await db.execute(
-        "DELETE FROM user_code_anchors WHERE snapshot_id = ? AND step_id IN ("
-        "  SELECT s.id FROM user_steps s JOIN user_flows f ON s.flow_id = f.id WHERE f.doc_id = ?"
-        ")",
-        (snapshot_id, doc_id),
-    )
-    await db.execute(
-        "DELETE FROM user_bd_mappings WHERE user_step_id IN ("
-        "  SELECT s.id FROM user_steps s JOIN user_flows f ON s.flow_id = f.id WHERE f.doc_id = ?"
-        ")",
-        (doc_id,),
-    )
-
-    # 3. Load steps and activities for this doc_id
+    # 2. Load steps and activities for this doc_id
     async with db.execute(
         "SELECT s.id, s.flow_id, s.ordinal, s.kind, s.section_id, s.text_ja, s.text_en, "
         "       s.trigger_ja, s.expected_ja, s.screen_name_ja, s.in_scope, s.scope_note, "
@@ -634,12 +733,22 @@ async def run_user_flow_alignment(
         run_id=run_id,
     )
 
-    # Build step-level activity & matched BD flow mapping
+    # Build step-level activity & matched BD flow mapping (best status: FULLY > PARTIAL > UNRESOLVED > NONE)
+    def _status_rank(s: str) -> int:
+        return {"FULLY": 3, "PARTIAL": 2, "UNRESOLVED": 1, "NONE": 0}.get(s, 0)
+
     step_activity_map: dict[str, dict[str, Any]] = {}
     for act in activities:
         act_matches = [m for m in tier1_matches if m["activity_id"] == act["id"]]
-        match_status = act_matches[0]["match_status"] if act_matches else "NONE"
-        matched_bd_ids = [m["bd_flow_id"] for m in act_matches if m.get("bd_flow_id")]
+        if act_matches:
+            best_status = max((m["match_status"] for m in act_matches), key=_status_rank)
+        else:
+            best_status = "NONE"
+        matched_bd_ids = [
+            m["bd_flow_id"]
+            for m in act_matches
+            if m.get("bd_flow_id") and m.get("match_status") in ("FULLY", "PARTIAL")
+        ]
         try:
             m_ids = json.loads(act.get("member_step_ids_json") or "[]")
         except Exception:
@@ -647,11 +756,11 @@ async def run_user_flow_alignment(
         for sid in m_ids:
             step_activity_map[sid] = {
                 "activity_id": act["id"],
-                "match_status": match_status,
+                "match_status": best_status,
                 "bd_flow_ids": matched_bd_ids,
             }
 
-    # Partition in-scope steps: FULLY/PARTIAL -> run tier-2 align; NONE -> skip tier-2
+    # Partition in-scope steps: FULLY/PARTIAL -> run tier-2 align; NONE/UNRESOLVED -> skip tier-2
     if activities:
         tier2_eval_steps = [
             s for s in in_scope_steps
@@ -659,13 +768,17 @@ async def run_user_flow_alignment(
         ]
         tier2_skipped_steps = [
             s for s in in_scope_steps
-            if step_activity_map.get(s["id"], {}).get("match_status") == "NONE" or s["id"] not in step_activity_map
+            if step_activity_map.get(s["id"], {}).get("match_status") in ("NONE", "UNRESOLVED") or s["id"] not in step_activity_map
         ]
     else:
         tier2_eval_steps = in_scope_steps
         tier2_skipped_steps = []
 
     skipped_step_ids = {s["id"] for s in tier2_skipped_steps}
+    unresolved_step_ids = {
+        s["id"] for s in tier2_skipped_steps
+        if step_activity_map.get(s["id"], {}).get("match_status") == "UNRESOLVED"
+    }
 
     # Phase U2 tier-2 rescope: step_id -> matched BD flow ids from tier-1. Opt-in only (None when
     # there are no activities at all) so the U-1 style call path stays byte-identical to today.
@@ -692,6 +805,8 @@ async def run_user_flow_alignment(
             step_bd_scope=step_bd_scope,
         )
 
+    evidence_backed_steps = int(run_summary.get("evidence_backed_steps", 0)) if isinstance(run_summary, dict) else 0
+
     # 6. Stage U4: Verdict verification + Activity & Flow Rollups
     verdict_summary = await run_user_flow_verdicts(
         db=db,
@@ -703,6 +818,7 @@ async def run_user_flow_alignment(
         skipped_step_ids=skipped_step_ids,
         activities=activities,
         step_bd_scope=step_bd_scope,
+        unresolved_step_ids=unresolved_step_ids,
     )
 
     await db.commit()
@@ -738,17 +854,47 @@ async def run_user_flow_alignment(
     total_logical = import_logical + tier1_logical + align_logical + verdict_logical
     total_physical = tier1_physical + align_physical + verdict_physical
 
-    matched_fully_cnt = sum(
-        1 for a in activities
-        if any(m["activity_id"] == a["id"] and m["match_status"] == "FULLY" for m in tier1_matches)
-    )
-    matched_partial_cnt = sum(
-        1 for a in activities
-        if any(m["activity_id"] == a["id"] and m["match_status"] == "PARTIAL" for m in tier1_matches)
-    )
-    matched_none_cnt = sum(
-        1 for a in activities
-        if any(m["activity_id"] == a["id"] and m["match_status"] == "NONE" for m in tier1_matches)
+    def _get_act_best_status(act_id: str) -> str:
+        act_m = [m for m in tier1_matches if m["activity_id"] == act_id]
+        if not act_m:
+            return "NONE"
+        return max((m["match_status"] for m in act_m), key=_status_rank)
+
+    best_act_statuses = [_get_act_best_status(a["id"]) for a in activities]
+    matched_fully_cnt = sum(1 for s in best_act_statuses if s == "FULLY")
+    matched_partial_cnt = sum(1 for s in best_act_statuses if s == "PARTIAL")
+    matched_none_cnt = sum(1 for s in best_act_statuses if s == "NONE")
+    matched_unresolved_cnt = sum(1 for s in best_act_statuses if s == "UNRESOLVED")
+
+    run_complete_summary = {
+        "doc_id": doc_id,
+        "run_id": run_id,
+        "cluster_id": cluster_id,
+        "snapshot_id": snapshot_id,
+        "total_steps": total_steps,
+        "in_scope_steps": len(in_scope_steps),
+        "anchored_steps": anchored_count,
+        "mapped_steps": mapped_count,
+        "semantic_mapped_steps": mapped_count,
+        "evidence_backed_steps": evidence_backed_steps,
+        "activities_total": len(activities),
+        "matched_fully": matched_fully_cnt,
+        "matched_partial": matched_partial_cnt,
+        "matched_none": matched_none_cnt,
+        "matched_unresolved": matched_unresolved_cnt,
+        "tier2_steps_run": len(tier2_eval_steps),
+        "tier2_steps_skipped": len(tier2_skipped_steps),
+        "status": "ok",
+        "completed_at": utc_now_iso(),
+    }
+
+    await _publish_completed_run(
+        db,
+        doc_id=doc_id,
+        cluster_id=cluster_id,
+        snapshot_id=snapshot_id,
+        run_id=run_id,
+        summary=run_complete_summary,
     )
 
     return UserFlowRunResult(
@@ -758,6 +904,8 @@ async def run_user_flow_alignment(
         in_scope_steps=len(in_scope_steps),
         anchored_steps=anchored_count,
         mapped_steps=mapped_count,
+        semantic_mapped_steps=mapped_count,
+        evidence_backed_steps=evidence_backed_steps,
         llm_batches_issued=tier1_logical + align_logical + verdict_logical,
         physical_llm_attempts=total_physical,
         import_llm_calls=import_logical,
@@ -766,6 +914,7 @@ async def run_user_flow_alignment(
         matched_fully=matched_fully_cnt,
         matched_partial=matched_partial_cnt,
         matched_none=matched_none_cnt,
+        matched_unresolved=matched_unresolved_cnt,
         tier2_steps_run=len(tier2_eval_steps),
         tier2_steps_skipped=len(tier2_skipped_steps),
         status="ok",

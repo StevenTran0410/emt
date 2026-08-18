@@ -32,6 +32,7 @@ from shared.utils import new_id, utc_now_iso
 async def _setup_synthetic_verdict_fixture(
     db: Any,
     tmp_path: Path,
+    run_id: str = "run_test",
 ) -> tuple[str, str, str, str, dict[str, str], dict[str, str]]:
     """Create synthetic snapshot, BD units, user flow with 5 steps (S1..S5)."""
     snapshot_id = f"snap:{new_id()}"
@@ -187,45 +188,45 @@ async def _setup_synthetic_verdict_fixture(
     # S1 has valid anchor on HNIXLOT.cbl and mapping to bs2
     await db.execute(
         "INSERT INTO user_code_anchors (id, run_id, snapshot_id, step_id, rel_path, line_start, line_end, kind, valid, reason, created_at) "
-        "VALUES (?, 'run1', ?, ?, 'HNIXLOT.cbl', 4, 4, 'llm_matched', 1, 'Valid code anchor', ?)",
-        (f"uca:{new_id()}", snapshot_id, s1_id, now),
+        "VALUES (?, ?, ?, ?, 'HNIXLOT.cbl', 4, 4, 'llm_matched', 1, 'Valid code anchor', ?)",
+        (f"uca:{new_id()}", run_id, snapshot_id, s1_id, now),
     )
     await db.execute(
         "INSERT INTO user_bd_mappings (id, run_id, user_step_id, bd_kind, bd_id, relation, confidence, reason, created_at) "
-        "VALUES (?, 'run1', ?, 'step', ?, 'realizes', 0.9, 'Direct match', ?)",
-        (f"ubm:{new_id()}", s1_id, bs2_id, now),
+        "VALUES (?, ?, ?, 'step', ?, 'realizes', 0.9, 'Direct match', ?)",
+        (f"ubm:{new_id()}", run_id, s1_id, bs2_id, now),
     )
 
     # S2 has valid code anchor on HNIXLOT.cbl:5, but upstream U3 wrongly mapped it to bs3
     await db.execute(
         "INSERT INTO user_code_anchors (id, run_id, snapshot_id, step_id, rel_path, line_start, line_end, kind, valid, reason, created_at) "
-        "VALUES (?, 'run1', ?, ?, 'HNIXLOT.cbl', 5, 5, 'llm_matched', 1, 'Error routine code anchor', ?)",
-        (f"uca:{new_id()}", snapshot_id, s2_id, now),
+        "VALUES (?, ?, ?, ?, 'HNIXLOT.cbl', 5, 5, 'llm_matched', 1, 'Error routine code anchor', ?)",
+        (f"uca:{new_id()}", run_id, snapshot_id, s2_id, now),
     )
     await db.execute(
         "INSERT INTO user_bd_mappings (id, run_id, user_step_id, bd_kind, bd_id, relation, confidence, reason, created_at) "
-        "VALUES (?, 'run1', ?, 'step', ?, 'realizes', 0.5, 'Wrong upstream mapping', ?)",
-        (f"ubm:{new_id()}", s2_id, bs3_id, now),
+        "VALUES (?, ?, ?, 'step', ?, 'realizes', 0.5, 'Wrong upstream mapping', ?)",
+        (f"ubm:{new_id()}", run_id, s2_id, bs3_id, now),
     )
 
     # S3 has mapping to bb1 + a valid code anchor on the F3:終了 (exit) panel line, which shows the
     # actual "terminate" behavior — the evidence needed to back a CONTRADICTED (BD asserts retry).
     await db.execute(
         "INSERT INTO user_bd_mappings (id, run_id, user_step_id, bd_kind, bd_id, relation, confidence, reason, created_at) "
-        "VALUES (?, 'run1', ?, 'branch', ?, 'realizes', 0.8, 'Mapped to error branch', ?)",
-        (f"ubm:{new_id()}", s3_id, bb1_id, now),
+        "VALUES (?, ?, ?, 'branch', ?, 'realizes', 0.8, 'Mapped to error branch', ?)",
+        (f"ubm:{new_id()}", run_id, s3_id, bb1_id, now),
     )
     await db.execute(
         "INSERT INTO user_code_anchors (id, run_id, snapshot_id, step_id, rel_path, line_start, line_end, kind, valid, reason, created_at) "
-        "VALUES (?, 'run1', ?, ?, 'FHNIXLOT.ipf', 5, 5, 'llm_matched', 1, 'F3 exit button anchor', ?)",
-        (f"uca:{new_id()}", snapshot_id, s3_id, now),
+        "VALUES (?, ?, ?, ?, 'FHNIXLOT.ipf', 5, 5, 'llm_matched', 1, 'F3 exit button anchor', ?)",
+        (f"uca:{new_id()}", run_id, snapshot_id, s3_id, now),
     )
 
     # S4 has presentation flag artifact in align
     await db.execute(
         "INSERT INTO user_run_artifacts (id, run_id, doc_id, ref_id, payload, created_at) "
-        "VALUES (?, 'run1', ?, ?, ?, ?)",
-        (f"ura:{new_id()}", doc_id, f"align:{s4_id}", json.dumps({"presentation": True}), now),
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (f"ura:{new_id()}", run_id, doc_id, f"align:{s4_id}", json.dumps({"presentation": True}), now),
     )
 
     step_ids = {"s1": s1_id, "s2": s2_id, "s3": s3_id, "s4": s4_id, "s5": s5_id}
@@ -612,9 +613,9 @@ async def test_report_endpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     async def _mock_stream(req: ChatRequest):
         results = [
-            {"unit_id": "u1", "verdict": "COVERED", "kept_bd_ids": ["bd1"], "citations": [{"rel_path": "HNIXLOT.cbl", "line_start": 4, "line_end": 4}], "corrected": False, "reason": "Valid match"},
+            {"unit_id": "u1", "verdict": "COVERED", "kept_bd_ids": ["bd3"], "citations": [{"rel_path": "HNIXLOT.cbl", "line_start": 4, "line_end": 4}], "corrected": False, "reason": "Valid match"},
             {"unit_id": "u2", "verdict": "BD_MISSING", "divergence": "behavioural", "kept_bd_ids": [], "citations": [{"rel_path": "HNIXLOT.cbl", "line_start": 5, "line_end": 5}], "corrected": True, "reason": "Missing in BD"},
-            {"unit_id": "u3", "verdict": "CONTRADICTED", "divergence": "behavioural", "kept_bd_ids": ["bd1"], "citations": [{"rel_path": "FHNIXLOT.ipf", "line_start": 5, "line_end": 5}], "corrected": False, "reason": "Conflict"},
+            {"unit_id": "u3", "verdict": "CONTRADICTED", "divergence": "behavioural", "kept_bd_ids": ["bd4"], "citations": [{"rel_path": "FHNIXLOT.ipf", "line_start": 5, "line_end": 5}], "corrected": False, "reason": "Conflict"},
             {"unit_id": "u4", "verdict": "UNVERIFIABLE", "kept_bd_ids": [], "citations": [], "corrected": False, "reason": "Visual"},
         ]
         yield {"type": "content", "text": json.dumps({"results": results})}
@@ -629,6 +630,17 @@ async def test_report_endpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         run_id="run_test",
         provider_id="mock_prov",
     )
+
+    # Publication contract (UP3-1): only a run whose completion marker names this
+    # (doc, cluster, snapshot) is reportable.
+    await db.execute(
+        "INSERT INTO user_run_artifacts (id, run_id, doc_id, ref_id, payload, created_at) "
+        "VALUES (?, 'run_test', ?, '__run_complete__', ?, ?)",
+        (f"ura:{new_id()}", doc_id,
+         json.dumps({"doc_id": doc_id, "run_id": "run_test", "cluster_id": cluster_id, "snapshot_id": snapshot_id}),
+         utc_now_iso()),
+    )
+    await db.commit()
 
     # Test report via FastAPI TestClient
     app = create_app()

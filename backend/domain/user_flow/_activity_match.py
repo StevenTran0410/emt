@@ -10,63 +10,70 @@ import json
 import logging
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
-from domain.business_flow_integrity._llm import assert_exact_id_coverage, call_with_reasoning_ladder
+from domain.business_flow_integrity._llm import call_with_reasoning_ladder
 from domain.doc_graph._llm_citation import _parse_llm_json
 from domain.model_connector.types import ChatMessage, ChatRequest
 from shared.utils import new_id, utc_now_iso
 
 logger = logging.getLogger("codespectra.user_flow.activity_match")
 
-TIER1_PROMPT_VERSION = "u2_match_v1"
-TIER1_SCHEMA_VERSION = "u2_match_v1"
+TIER1_PROMPT_VERSION = "u2_match_v2"
+TIER1_SCHEMA_VERSION = "u2_match_v2"
 _MAX_CONCURRENT_MATCHING = 4
 _semaphore = asyncio.Semaphore(_MAX_CONCURRENT_MATCHING)
 BATCH_SIZE = 5
 
-MatchStatus = Literal["FULLY", "PARTIAL", "NONE"]
+MatchStatus = Literal["FULLY", "PARTIAL", "NONE", "UNRESOLVED"]
 
 
-# Schema tolerance (U-1 lesson): extra="ignore" + defaults — strict/forbid rejected real model
-# output wholesale (missing confidence/reason → every batch fell back to NONE).
-class LLMActivityMatchItem(BaseModel):
+class LLMActivityMatchPair(BaseModel):
     model_config = ConfigDict(extra="ignore")
     activity_alias: str
-    match_status: MatchStatus
-    bd_flow_aliases: list[str] = []  # e.g. ["bf1", "bf3"] or []
-    confidence: float = 0.5
+    bd_flow_alias: str | None = None  # None for NONE status
+    match_status: Literal["FULLY", "PARTIAL", "NONE"]
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     reason: str = ""
 
 
 class LLMTier1MatchResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    matches: list[LLMActivityMatchItem]
+    matches: list[LLMActivityMatchPair]
 
 
 _TIER1_SYSTEM_PROMPT = """You are an expert systems auditor performing Tier-1 high-level reconciliation between customer user activities and specification Business Flows (BD Flows).
 
 For each user activity in the batch, determine whether it corresponds to one or more specification BD Flows in the catalog:
-- FULLY: The activity's business purpose is fully covered by the matched BD Flow(s).
-- PARTIAL: The activity has substantial overlap with the matched BD Flow(s), but some customer requirements are not covered in the BD specification.
+- FULLY: The activity's business purpose is fully covered by the matched BD Flow.
+- PARTIAL: The activity has substantial overlap with the matched BD Flow, but some customer requirements are not covered in the BD specification.
 - NONE: The customer performs this activity, but the system specification (BD) has NO corresponding business flow for it.
 
 CRITICAL RULES:
-1. NONE is a legitimate, expected answer. If an activity describes functionality absent from the BD catalog, choose NONE. NEVER force a weak or vague match.
-2. If match_status is "NONE", bd_flow_aliases MUST be empty [].
-3. If match_status is "FULLY" or "PARTIAL", bd_flow_aliases MUST list 1 or more matching BD flow aliases (e.g. ["bf1"]).
-4. Every activity alias (e.g. a1, a2, ...) in the batch MUST be included in the matches list exactly once.
-5. Output pure valid JSON.
+1. NONE is a legitimate, expected answer. If an activity describes functionality absent from the BD catalog, choose NONE.
+2. If the activity plausibly relates to a flow but you are unsure, emit a PARTIAL pair with low confidence rather than NONE. Reserve NONE for activities with no plausible flow.
+3. An activity may match multiple BD Flows. Emit one object per (activity, bd_flow) pair with its own match_status, confidence, and reason.
+4. If an activity matches NO BD flows, emit exactly ONE object with bd_flow_alias: null and match_status: "NONE".
+5. Do NOT mix NONE with FULLY/PARTIAL for the same activity. An activity has either exactly one NONE or one or more FULLY/PARTIAL pairs.
+6. Every activity alias (e.g. a1, a2, ...) in the batch MUST have at least one match entry.
+7. Output pure valid JSON.
 
-OUTPUT JSON SCHEMA (every field is required for every match):
+OUTPUT JSON SCHEMA:
 {
   "matches": [
     {
       "activity_alias": "a1",
+      "bd_flow_alias": "bf3",
       "match_status": "FULLY",
-      "bd_flow_aliases": ["bf3"],
       "confidence": 0.85,
-      "reason": "1 short sentence explaining the match or why NONE."
+      "reason": "Activity purpose matches BD flow bf3."
+    },
+    {
+      "activity_alias": "a2",
+      "bd_flow_alias": null,
+      "match_status": "NONE",
+      "confidence": 0.90,
+      "reason": "No plausible specification flow in catalog."
     }
   ]
 }
@@ -74,18 +81,58 @@ OUTPUT JSON SCHEMA (every field is required for every match):
 
 
 async def _load_cluster_bd_flows(db: Any, cluster_id: str) -> list[dict[str, Any]]:
-    """Load all BD business flows for the cluster."""
+    """Load all BD business flows for the cluster with their step and branch rosters."""
     async with db.execute(
-        "SELECT id, ordinal, name, description, block_key FROM bd_business_flows WHERE cluster_id = ? ORDER BY ordinal",
+        "SELECT id, ordinal, name, description, block_key FROM bd_business_flows WHERE cluster_id = ? ORDER BY ordinal, id",
         (cluster_id,),
     ) as cur:
         rows = await cur.fetchall()
-    return [
+
+    flows: list[dict[str, Any]] = [
         dict(r) if hasattr(r, "keys") else {
             "id": r[0], "ordinal": r[1], "name": r[2], "description": r[3], "block_key": r[4]
         }
         for r in rows
     ]
+    if not flows:
+        return []
+
+    flow_ids = [f["id"] for f in flows]
+    placeholders = ",".join("?" for _ in flow_ids)
+
+    # Load steps for catalog roster
+    async with db.execute(
+        f"SELECT id, flow_id, name, functionality, ordinal FROM bd_business_steps WHERE flow_id IN ({placeholders}) ORDER BY ordinal, id",
+        flow_ids,
+    ) as cur:
+        step_rows = await cur.fetchall()
+
+    steps_by_flow: dict[str, list[dict[str, Any]]] = {}
+    for r in step_rows:
+        s_d = dict(r) if hasattr(r, "keys") else {
+            "id": r[0], "flow_id": r[1], "name": r[2], "functionality": r[3], "ordinal": r[4]
+        }
+        steps_by_flow.setdefault(s_d["flow_id"], []).append(s_d)
+
+    # Load branches for catalog roster
+    async with db.execute(
+        f"SELECT id, flow_id, branch_kind, guard_description FROM bd_business_branches WHERE flow_id IN ({placeholders}) ORDER BY id",
+        flow_ids,
+    ) as cur:
+        branch_rows = await cur.fetchall()
+
+    branches_by_flow: dict[str, list[dict[str, Any]]] = {}
+    for r in branch_rows:
+        b_d = dict(r) if hasattr(r, "keys") else {
+            "id": r[0], "flow_id": r[1], "branch_kind": r[2], "guard_description": r[3]
+        }
+        branches_by_flow.setdefault(b_d["flow_id"], []).append(b_d)
+
+    for f in flows:
+        f["steps"] = steps_by_flow.get(f["id"], [])
+        f["branches"] = branches_by_flow.get(f["id"], [])
+
+    return flows
 
 
 async def _evaluate_activity_batch(
@@ -95,14 +142,38 @@ async def _evaluate_activity_batch(
     provider_id: str | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Match a single batch of <= 5 activities against BD flows."""
-    # Build BD Catalog Registry
+    # Build BD Catalog Registry with enriched step/branch roster
     bd_alias_to_id: dict[str, str] = {}
     bd_catalog_lines: list[str] = []
     for i, bf in enumerate(bd_flows, 1):
         alias = f"bf{i}"
         bd_alias_to_id[alias] = bf["id"]
         desc = bf.get("description") or "No description provided."
-        bd_catalog_lines.append(f"{alias} | {bf['name']} | {desc}")
+
+        step_roster: list[str] = []
+        for s in bf.get("steps", []):
+            s_name = s.get("name") or ""
+            s_func = s.get("functionality") or ""
+            if s_func and s_func != s_name:
+                step_roster.append(f"{s_name} ({s_func})")
+            elif s_name:
+                step_roster.append(s_name)
+
+        branch_roster: list[str] = []
+        for b in bf.get("branches", []):
+            b_kind = (b.get("branch_kind") or "").lower()
+            b_guard = b.get("guard_description") or ""
+            if b_kind not in ("success", "normal") and b_guard:
+                branch_roster.append(f"[{b.get('branch_kind')}] {b_guard}")
+
+        roster_items: list[str] = []
+        if step_roster:
+            roster_items.append("Steps: " + "; ".join(step_roster))
+        if branch_roster:
+            roster_items.append("Non-SUCCESS branches: " + "; ".join(branch_roster))
+
+        roster_str = ("\n    - " + "\n    - ".join(roster_items)) if roster_items else ""
+        bd_catalog_lines.append(f"{alias} | {bf['name']} | {desc}{roster_str}")
 
     # Build Activity Batch Registry
     act_alias_to_id: dict[str, str] = {}
@@ -133,19 +204,32 @@ USER ACTIVITIES TO MATCH ({len(batch_activities)} activities):
 Evaluate each activity a1..a{len(batch_activities)}. Output JSON matching the schema.
 """
 
-    if not provider_id or not bd_flows:
-        # Offline or empty BD catalog fallback -> all NONE
-        default_matches = [
+    if not provider_id:
+        # No provider means the question was never asked. NONE claims "the specification has no
+        # such flow" — a finding that would go on to manufacture BD_EXTRA — so stay UNRESOLVED.
+        return [
             {
                 "activity_id": act["id"],
-                "bd_flow_ids": [],
-                "match_status": "NONE",
+                "bd_flow_id": None,
+                "match_status": "UNRESOLVED",
                 "confidence": 0.0,
-                "reason": "offline_mode_or_no_bd_flows",
+                "reason": "NO_PROVIDER",
             }
             for act in batch_activities
-        ]
-        return default_matches, {"origin": "fallback", "reason": "offline"}
+        ], {"origin": "fallback", "reason": "NO_PROVIDER"}
+
+    if not bd_flows:
+        # An empty catalog is a real answer: there is genuinely no BD flow to match against.
+        return [
+            {
+                "activity_id": act["id"],
+                "bd_flow_id": None,
+                "match_status": "NONE",
+                "confidence": 0.0,
+                "reason": "no_bd_flows_in_cluster",
+            }
+            for act in batch_activities
+        ], {"origin": "fallback", "reason": "no_bd_flows_in_cluster"}
 
     def _build_request(effort: str) -> ChatRequest:
         return ChatRequest(
@@ -167,20 +251,53 @@ Evaluate each activity a1..a{len(batch_activities)}. Output JSON matching the sc
             data = {"matches": data}
         res = LLMTier1MatchResponse.model_validate(data)
 
-        # Exact coverage: every expected activity alias exactly once, no unknowns, no duplicates.
-        assert_exact_id_coverage(
-            [m.activity_alias for m in res.matches],
-            set(act_alias_to_id.keys()),
-            "Tier1 activity match",
-        )
+        # Invariant 1: Group matches by activity_alias
+        expected_act_aliases = set(act_alias_to_id.keys())
+        expected_flow_aliases = set(bd_alias_to_id.keys())
 
-        # Validate bd_flow_aliases exist
+        grouped: dict[str, list[LLMActivityMatchPair]] = {}
         for m in res.matches:
-            if m.match_status == "NONE" and m.bd_flow_aliases:
-                raise ValueError("Tier1 activity match: NONE match cannot have bd_flow_aliases")
-            for bfa in m.bd_flow_aliases:
-                if bfa not in bd_alias_to_id:
-                    raise ValueError(f"Tier1 activity match: unknown bd_flow_alias {bfa}")
+            if m.activity_alias not in expected_act_aliases:
+                raise ValueError(f"Tier1 activity match: unknown activity_alias '{m.activity_alias}'")
+            grouped.setdefault(m.activity_alias, []).append(m)
+
+        # Invariant 2: Every expected activity alias must appear in matches (>= 1 row)
+        missing_acts = expected_act_aliases - set(grouped.keys())
+        if missing_acts:
+            raise ValueError(f"Tier1 activity match: missing expected activities: {sorted(missing_acts)}")
+
+        # Invariants 3-7: Per activity invariants
+        for act_alias, items in grouped.items():
+            seen_flows: set[str | None] = set()
+            for it in items:
+                flow_key = it.bd_flow_alias.strip() if isinstance(it.bd_flow_alias, str) and it.bd_flow_alias.strip() else None
+                if flow_key in seen_flows:
+                    raise ValueError(f"Tier1 activity match: duplicate (activity, flow) pair for {act_alias}, {flow_key}")
+                seen_flows.add(flow_key)
+
+                # Finite float confidence [0, 1]
+                if not isinstance(it.confidence, (int, float)) or it.confidence < 0.0 or it.confidence > 1.0:
+                    it.confidence = max(0.0, min(1.0, float(it.confidence)))
+
+            has_none = any(it.match_status == "NONE" for it in items)
+            has_positive = any(it.match_status in ("FULLY", "PARTIAL") for it in items)
+
+            # Exactly one NONE row XOR >=1 positive rows (never both)
+            if has_none and has_positive:
+                raise ValueError(f"Tier1 activity match: activity {act_alias} contains both NONE and FULLY/PARTIAL matches")
+
+            if has_none:
+                if len(items) != 1:
+                    raise ValueError(f"Tier1 activity match: activity {act_alias} with NONE match has multiple entries ({len(items)})")
+                it = items[0]
+                if it.bd_flow_alias is not None and str(it.bd_flow_alias).strip().lower() not in ("", "null", "none"):
+                    raise ValueError(f"Tier1 activity match: activity {act_alias} with NONE status must have null bd_flow_alias")
+            else:
+                for it in items:
+                    if not it.bd_flow_alias:
+                        raise ValueError(f"Tier1 activity match: activity {act_alias} positive match {it.match_status} requires non-null bd_flow_alias")
+                    if it.bd_flow_alias not in expected_flow_aliases:
+                        raise ValueError(f"Tier1 activity match: activity {act_alias} references unknown bd_flow_alias '{it.bd_flow_alias}'")
 
         return res
 
@@ -202,13 +319,13 @@ Evaluate each activity a1..a{len(batch_activities)}. Output JSON matching the sc
             logger.error(f"[activity_match] Batch LLM call failed: {e}")
 
     if not validated_resp or not validated_resp.matches:
-        # Total failure -> record NONE with LLM_NO_RESPONSE
-        logger.warning("[activity_match] Batch matching failed. Falling back to NONE.")
+        # Total failure -> record UNRESOLVED with LLM_NO_RESPONSE (honest failure state)
+        logger.warning("[activity_match] Batch matching failed. Falling back to UNRESOLVED.")
         default_matches = [
             {
                 "activity_id": act["id"],
-                "bd_flow_ids": [],
-                "match_status": "NONE",
+                "bd_flow_id": None,
+                "match_status": "UNRESOLVED",
                 "confidence": 0.0,
                 "reason": "LLM_NO_RESPONSE",
             }
@@ -221,10 +338,10 @@ Evaluate each activity a1..a{len(batch_activities)}. Output JSON matching the sc
         if m.activity_alias not in act_alias_to_id:
             continue
         act_id = act_alias_to_id[m.activity_alias]
-        real_bd_ids = [bd_alias_to_id[bfa] for bfa in m.bd_flow_aliases if bfa in bd_alias_to_id]
+        real_bd_id = bd_alias_to_id[m.bd_flow_alias] if m.bd_flow_alias and m.bd_flow_alias in bd_alias_to_id else None
         results.append({
             "activity_id": act_id,
-            "bd_flow_ids": real_bd_ids,
+            "bd_flow_id": real_bd_id,
             "match_status": m.match_status,
             "confidence": m.confidence,
             "reason": m.reason,
@@ -278,41 +395,23 @@ async def match_user_activities_to_bd_flows(
         match_status = item["match_status"]
         conf = item["confidence"]
         reason = item["reason"]
-        bd_flow_ids = item.get("bd_flow_ids") or []
+        bfid = item.get("bd_flow_id")
 
-        if match_status == "NONE" or not bd_flow_ids:
-            row_id = f"uactm:{new_id()}"
-            await db.execute(
-                "INSERT INTO user_activity_matches (id, run_id, activity_id, bd_flow_id, match_status, confidence, reason, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (row_id, run_id, act_id, None, "NONE", conf, reason, utc_now_iso()),
-            )
-            rows_to_insert.append({
-                "id": row_id,
-                "run_id": run_id,
-                "activity_id": act_id,
-                "bd_flow_id": None,
-                "match_status": "NONE",
-                "confidence": conf,
-                "reason": reason,
-            })
-        else:
-            for bfid in bd_flow_ids:
-                row_id = f"uactm:{new_id()}"
-                await db.execute(
-                    "INSERT INTO user_activity_matches (id, run_id, activity_id, bd_flow_id, match_status, confidence, reason, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (row_id, run_id, act_id, bfid, match_status, conf, reason, utc_now_iso()),
-                )
-                rows_to_insert.append({
-                    "id": row_id,
-                    "run_id": run_id,
-                    "activity_id": act_id,
-                    "bd_flow_id": bfid,
-                    "match_status": match_status,
-                    "confidence": conf,
-                    "reason": reason,
-                })
+        row_id = f"uactm:{new_id()}"
+        await db.execute(
+            "INSERT INTO user_activity_matches (id, run_id, activity_id, bd_flow_id, match_status, confidence, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (row_id, run_id, act_id, bfid, match_status, conf, reason, utc_now_iso()),
+        )
+        rows_to_insert.append({
+            "id": row_id,
+            "run_id": run_id,
+            "activity_id": act_id,
+            "bd_flow_id": bfid,
+            "match_status": match_status,
+            "confidence": conf,
+            "reason": reason,
+        })
 
     await db.commit()
 

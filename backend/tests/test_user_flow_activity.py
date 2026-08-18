@@ -274,15 +274,15 @@ async def test_tier1_activity_matcher(app_db: Any, tmp_path: Path, monkeypatch: 
         "matches": [
             {
                 "activity_alias": "a1",
+                "bd_flow_alias": "bf1",
                 "match_status": "FULLY",
-                "bd_flow_aliases": ["bf1"],
                 "confidence": 0.95,
                 "reason": "Matches coil process flow directly",
             },
             {
                 "activity_alias": "a2",
+                "bd_flow_alias": None,
                 "match_status": "NONE",
-                "bd_flow_aliases": [],
                 "confidence": 0.90,
                 "reason": "Client custom feature, absent from BD specs",
             },
@@ -339,8 +339,8 @@ async def test_tier1_gating_skips_tier2_for_none_activity(
 
     tier1_response = {
         "matches": [
-            {"activity_alias": "a1", "match_status": "FULLY", "bd_flow_aliases": ["bf1"], "confidence": 0.9, "reason": "Matches coil flow"},
-            {"activity_alias": "a2", "match_status": "NONE", "bd_flow_aliases": [], "confidence": 0.9, "reason": "No BD match"},
+            {"activity_alias": "a1", "bd_flow_alias": "bf1", "match_status": "FULLY", "confidence": 0.9, "reason": "Matches coil flow"},
+            {"activity_alias": "a2", "bd_flow_alias": None, "match_status": "NONE", "confidence": 0.9, "reason": "No BD match"},
         ]
     }
 
@@ -462,6 +462,14 @@ async def test_activity_rollup_report_and_graph(
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (f"uv:{new_id()}", run_id, doc_id, clust_id, snap_id, "user", s["id"], "step", "COVERED", None, "Covered", "{}", now),
         )
+    # Publication contract (UP3-1): only a run whose completion marker names this
+    # (doc, cluster, snapshot) is reportable.
+    await app_db.execute(
+        "INSERT INTO user_run_artifacts (id, run_id, doc_id, ref_id, payload, created_at) "
+        "VALUES (?, ?, ?, '__run_complete__', ?, ?)",
+        (f"ura:{new_id()}", run_id, doc_id,
+         json.dumps({"doc_id": doc_id, "run_id": run_id, "cluster_id": clust_id, "snapshot_id": snap_id}), now),
+    )
     await app_db.commit()
 
     # 1. Test Report Query
@@ -518,8 +526,8 @@ async def test_tier2_bd_catalog_scoped_to_matched_flow(
     # Both activities FULLY-matched, each to a DIFFERENT BD flow, so tier-2 runs for all 8 steps.
     tier1_response = {
         "matches": [
-            {"activity_alias": "a1", "match_status": "FULLY", "bd_flow_aliases": ["bf1"], "confidence": 0.9, "reason": "Matches coil flow"},
-            {"activity_alias": "a2", "match_status": "FULLY", "bd_flow_aliases": ["bf2"], "confidence": 0.9, "reason": "Matches error flow"},
+            {"activity_alias": "a1", "bd_flow_alias": "bf1", "match_status": "FULLY", "confidence": 0.9, "reason": "Matches coil flow"},
+            {"activity_alias": "a2", "bd_flow_alias": "bf2", "match_status": "FULLY", "confidence": 0.9, "reason": "Matches error flow"},
         ]
     }
 
@@ -572,6 +580,152 @@ async def test_tier2_bd_catalog_scoped_to_matched_flow(
                 )
 
     assert len(seen_aliases) == 8
+
+
+@pytest.mark.asyncio
+async def test_tier1_total_failure_is_unresolved_end_to_end(
+    app_db: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """UP3-2 A3 + UP3-3 C1: a failed tier-1 must never be reported as the finding 'NONE'.
+    Rows persist as UNRESOLVED, skipped steps say TIER1_UNRESOLVED, and no BD unit is BD_EXTRA."""
+    snap_id, clust_id, doc_id, flow_id, steps, bd_flows = await _setup_synthetic_activity_fixture(app_db, tmp_path)
+    now = utc_now_iso()
+
+    act1_id = f"act:{new_id()}"
+    await app_db.execute(
+        "INSERT INTO user_activities (id, flow_id, ordinal, name_en, name_ja, summary_en, member_step_ids_json, sheet_span_json, step_count, action_count, error_rule_count, expectation_count, origin, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (act1_id, flow_id, 1, "Coil Processing", "コイル処理", "Processes coil", json.dumps([s["id"] for s in steps]), "[\"想定表\"]", 8, 4, 0, 4, "llm", now),
+    )
+    await app_db.commit()
+
+    async def _mock_chat(self, req: ChatRequest, model_id: str | None = None):
+        user_msg = req.messages[1].content if len(req.messages) > 1 else ""
+        if "BD FLOWS CATALOG" in user_msg:
+            # Both ladder attempts return an unusable payload -> honest failure state.
+            yield {"type": "content", "text": json.dumps({"matches": []})}
+        else:
+            yield {"type": "content", "text": json.dumps({"results": []})}
+
+    monkeypatch.setattr(ProviderConfigService, "chat_stream_events", _mock_chat)
+
+    res: UserFlowRunResult = await run_user_flow_alignment(
+        db=app_db, doc_id=doc_id, cluster_id=clust_id, snapshot_id=snap_id, provider_id="prov:test",
+    )
+
+    async with app_db.execute(
+        "SELECT match_status, reason FROM user_activity_matches WHERE run_id = ?", (res.run_id,)
+    ) as cur:
+        m_rows = await cur.fetchall()
+    assert [r[0] for r in m_rows] == ["UNRESOLVED"]
+    assert m_rows[0][1] == "LLM_NO_RESPONSE"
+
+    assert res.tier2_steps_run == 0
+    assert res.tier2_steps_skipped == 8
+    # An unresolved activity is counted apart from a genuine NONE: it is not a finding.
+    assert res.matched_unresolved == 1
+    assert res.matched_none == 0
+
+    async with app_db.execute(
+        "SELECT reason FROM user_verdicts WHERE run_id = ? AND side = 'user' AND ref_kind = 'step'",
+        (res.run_id,),
+    ) as cur:
+        reasons = [r[0] for r in await cur.fetchall()]
+    assert len(reasons) == 8
+    assert all("TIER1_UNRESOLVED" in r for r in reasons)
+    assert not any("TIER1_NONE_MATCH" in r for r in reasons)
+
+    # No BD unit may be called BD_EXTRA off the back of a failed tier-1.
+    async with app_db.execute(
+        "SELECT verdict, COUNT(*) FROM user_verdicts WHERE run_id = ? AND side = 'bd' GROUP BY verdict",
+        (res.run_id,),
+    ) as cur:
+        bd_counts = {r[0]: r[1] for r in await cur.fetchall()}
+    assert "BD_EXTRA" not in bd_counts
+    assert bd_counts.get("UNRESOLVED", 0) > 0
+
+
+@pytest.mark.asyncio
+async def test_tier1_mixed_pair_statuses_drive_gate_and_scope(
+    app_db: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """UP3-2 A6: an activity with FULLY + PARTIAL pairs is gated by its BEST status (runs tier-2)
+    and its candidate scope is the UNION of both matched flows; a NONE activity is still skipped."""
+    snap_id, clust_id, doc_id, flow_id, steps, bd_flows = await _setup_synthetic_activity_fixture(app_db, tmp_path)
+    now = utc_now_iso()
+
+    act1_id = f"act:{new_id()}"
+    act2_id = f"act:{new_id()}"
+    await app_db.execute(
+        "INSERT INTO user_activities (id, flow_id, ordinal, name_en, name_ja, summary_en, member_step_ids_json, sheet_span_json, step_count, action_count, error_rule_count, expectation_count, origin, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (act1_id, flow_id, 1, "Coil Processing", "コイル処理", "Processes coil", json.dumps([s["id"] for s in steps[:4]]), "[\"想定表\"]", 4, 2, 0, 2, "llm", now),
+    )
+    await app_db.execute(
+        "INSERT INTO user_activities (id, flow_id, ordinal, name_en, name_ja, summary_en, member_step_ids_json, sheet_span_json, step_count, action_count, error_rule_count, expectation_count, origin, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (act2_id, flow_id, 2, "Host Error Handling", "エラー処理", "Handles host errors", json.dumps([s["id"] for s in steps[4:]]), "[\"ホスト_エラー1\"]", 4, 2, 0, 2, "llm", now),
+    )
+    await app_db.commit()
+
+    tier1_response = {
+        "matches": [
+            {"activity_alias": "a1", "bd_flow_alias": "bf2", "match_status": "PARTIAL", "confidence": 0.6, "reason": "Partial overlap"},
+            {"activity_alias": "a1", "bd_flow_alias": "bf1", "match_status": "FULLY", "confidence": 0.9, "reason": "Matches coil flow"},
+            {"activity_alias": "a2", "bd_flow_alias": None, "match_status": "NONE", "confidence": 0.9, "reason": "No BD match"},
+        ]
+    }
+
+    captured_align_payloads: list[dict[str, Any]] = []
+
+    async def _mock_chat(self, req: ChatRequest, model_id: str | None = None):
+        user_msg = req.messages[1].content if len(req.messages) > 1 else ""
+        if "BD FLOWS CATALOG" in user_msg:
+            yield {"type": "content", "text": json.dumps(tier1_response)}
+        elif '"steps_to_align"' in user_msg:
+            payload = json.loads(user_msg)
+            captured_align_payloads.append(payload)
+            results = [
+                {"step_id": step["step_id"], "presentation": False, "claims": [], "bd_mappings": []}
+                for step in payload["steps_to_align"]
+            ]
+            yield {"type": "content", "text": json.dumps({"results": results})}
+        else:
+            yield {"type": "content", "text": json.dumps({"results": []})}
+
+    monkeypatch.setattr(ProviderConfigService, "chat_stream_events", _mock_chat)
+
+    res: UserFlowRunResult = await run_user_flow_alignment(
+        db=app_db,
+        doc_id=doc_id,
+        cluster_id=clust_id,
+        snapshot_id=snap_id,
+        provider_id="prov:test",
+    )
+
+    # Best-status gate: act1 (FULLY over PARTIAL) runs, act2 (NONE) is skipped.
+    assert res.tier2_steps_run == 4
+    assert res.tier2_steps_skipped == 4
+    # Run totals count each activity once by its best status.
+    assert res.matched_fully == 1
+    assert res.matched_partial == 0
+    assert res.matched_none == 1
+
+    # Both pairs persisted for act1 with their own statuses.
+    async with app_db.execute(
+        "SELECT bd_flow_id, match_status FROM user_activity_matches WHERE run_id = ? AND activity_id = ?",
+        (res.run_id, act1_id),
+    ) as cur:
+        pair_rows = {r[0]: r[1] for r in await cur.fetchall()}
+    assert pair_rows == {bd_flows[0]["id"]: "FULLY", bd_flows[1]["id"]: "PARTIAL"}
+
+    # Scope is the union of BOTH positively matched flows.
+    shown_names: set[str] = set()
+    for payload in captured_align_payloads:
+        for step_entry in payload["steps_to_align"]:
+            shown_names.update(c["name"] for c in step_entry["bd_candidates"])
+    assert "Process Coil Lot" in shown_names
+    assert "Handle Host Errors" in shown_names
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +818,7 @@ async def test_activity_stages_request_shape(
                 "type": "content",
                 "text": json.dumps({
                     "matches": [
-                        {"activity_alias": "a1", "match_status": "NONE", "bd_flow_aliases": [], "confidence": 0.5, "reason": "r"}
+                        {"activity_alias": "a1", "bd_flow_alias": None, "match_status": "NONE", "confidence": 0.5, "reason": "r"}
                     ]
                 }),
             }
@@ -703,7 +857,7 @@ async def test_tier1_duplicate_alias_rejected(
 ):
     """FIX 5: a reply listing the same activity_alias twice must be rejected (exact coverage),
     not silently accepted as a subset match. Both ladder attempts get the same duplicate reply,
-    so it exhausts to the deterministic NONE fallback with exactly one row (no duplicates)."""
+    so it exhausts to the deterministic UNRESOLVED fallback with exactly one row (no duplicates)."""
     snap_id, clust_id, doc_id, flow_id, steps, bd_flows = await _setup_synthetic_activity_fixture(app_db, tmp_path)
 
     act1_id = f"act:{new_id()}"
@@ -718,11 +872,11 @@ async def test_tier1_duplicate_alias_rejected(
         },
     ]
 
-    # a1 listed twice: a naive `expected.issubset(covered)` set check would incorrectly pass this.
+    # a1 listed twice with duplicate (activity, flow) pair: rejected.
     duplicate_payload = {
         "matches": [
-            {"activity_alias": "a1", "match_status": "FULLY", "bd_flow_aliases": ["bf1"], "confidence": 0.9, "reason": "first"},
-            {"activity_alias": "a1", "match_status": "FULLY", "bd_flow_aliases": ["bf1"], "confidence": 0.9, "reason": "dup"},
+            {"activity_alias": "a1", "bd_flow_alias": "bf1", "match_status": "FULLY", "confidence": 0.9, "reason": "first"},
+            {"activity_alias": "a1", "bd_flow_alias": "bf1", "match_status": "FULLY", "confidence": 0.9, "reason": "dup"},
         ]
     }
 
@@ -738,7 +892,7 @@ async def test_tier1_duplicate_alias_rejected(
 
     assert len(matches) == 1
     assert matches[0]["activity_id"] == act1_id
-    assert matches[0]["match_status"] == "NONE"
+    assert matches[0]["match_status"] == "UNRESOLVED"
     assert matches[0]["reason"] == "LLM_NO_RESPONSE"
 
     async with app_db.execute(

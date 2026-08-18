@@ -11,11 +11,14 @@ Judges the final user-flow verdicts:
    - Re-fetches cited lines via resolve_citation + window containment against shown snippets.
    - Invalid citation -> UNVERIFIABLE (CITATION_INVALID / CITATION_OUT_OF_WINDOW).
    - BD_MISSING / CONTRADICTED require >= 1 valid citation.
-   - COVERED requires valid citation (basis: 'own_citation') or mapped BD unit with MATCH/PARTIAL (basis: 'bd_verdict').
+   - COVERED requires >=1 verifier-kept BD mapping AND (valid citation -> basis 'own_citation'
+     | kept basis unit with BD<->code verdict MATCH/PARTIAL -> basis 'bd_verdict').
    - LLM_NO_RESPONSE -> UNVERIFIABLE.
-4. BD-side verdicts:
-   - Unreferenced BD units -> BD_EXTRA (side='bd').
-   - Mapped BD units -> COVERED (side='bd').
+4. BD-side verdicts (three-state, from verifier-KEPT mappings only):
+   - COVERED: >= 1 kept mapping reached the unit.
+   - BD_UNMAPPED: parent flow matched in tier-1 but no kept mapping reached the unit (recall artifact).
+   - BD_EXTRA: parent flow has no accepted tier-1 pair (a real spec finding).
+   - UNRESOLVED: tier-1 did not resolve, so the unit's status is unassessed (neither list).
 5. Deterministic flow-level rollup (§3b):
    - Computes MATCHED | PARTIAL | DIVERGENT | UNCOVERED | OUT_OF_SCOPE per flow.
    - Persists user_verdicts (step, flow, bd) + step verdict artifacts.
@@ -44,6 +47,7 @@ from domain.model_connector.types import ChatMessage, ChatRequest
 from shared.logger import logger
 from shared.utils import new_id, utc_now_iso
 
+from ._align import COVERAGE_RELATIONS, _shortlist_bd_candidates, render_bd_candidate_name
 from ._anchor import (
     SeedHit,
     resolve_step_files,
@@ -54,25 +58,65 @@ from ._mapping import BDContext, BDUnit, load_bd_context
 
 
 _VERDICT_BATCH_SIZE = 5
+_MAX_EVIDENCE_SUMMARY = 3
+_MAX_EVIDENCE_CHARS = 160
+
+
+def _summarize_unit_evidence(evidence_json: str | None) -> list[str]:
+    """Condense a BD unit's stored code evidence into a few short lines for the verifier payload.
+
+    Basis (ii) asks the model whether a MATCH/PARTIAL unit really implements THIS step; without
+    the evidence behind that stored verdict the judgment is blind, and for PARTIAL units it is the
+    only way to tell which subclaim was actually verified."""
+    if not evidence_json:
+        return []
+    try:
+        items = json.loads(evidence_json)
+    except Exception:
+        return []
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list):
+        return []
+
+    out: list[str] = []
+    for it in items[:_MAX_EVIDENCE_SUMMARY]:
+        if isinstance(it, dict):
+            where = it.get("rel_path") or it.get("file") or ""
+            line_s = it.get("line_start")
+            line_e = it.get("line_end")
+            text = (it.get("text") or it.get("snippet") or it.get("reason") or "").strip().replace("\n", " ")
+            loc = f"{where}:{line_s}-{line_e}" if where and line_s is not None else where
+            line = f"{loc} {text}".strip() if loc else text
+        else:
+            line = str(it).strip().replace("\n", " ")
+        if line:
+            out.append(line[:_MAX_EVIDENCE_CHARS])
+    return out
 
 _VERDICT_SYSTEM_PROMPT = """You are the FINAL verifier and corrector for user-flow alignment between customer business flows, \
 AI-generated Business Design (BD) documents, and legacy mainframe source code.
 
 For each user step, you are given:
 - Step details: text_ja, text_en, kind, trigger, expected, section_id, screen_name_ja
-- anchor_result: Upstream code anchor proposal (citations, fetched verbatim text, reason) — unverified hypothesis
-- bd_mappings: Upstream BD mapping proposals (mapped BD units, functionality, BD<->code verdict, confidence, reason) — unverified hypothesis
+- anchor_result: Upstream code anchor proposal (citations, fetched verbatim text, reason) — unverified hypothesis. You may ADOPT valid upstream anchor citations.
+- bd_mappings: Upstream BD mapping proposals (mapped BD units, functionality, BD<->code verdict, BD<->code verdict reason, confidence, reason) — unverified hypothesis
+- bd_candidates: The scoped candidate BD units for this step
 - snippets: The real candidate source code snippets shown for this step
 
 Treat upstream proposals as UNVERIFIED HYPOTHESES. Upstream agents may be wrong:
 - The anchor matcher may have mis-cited or missed a contradicting line in the snippets.
 - The BD mapper may have mapped to an irrelevant BD unit or missed a relevant one.
 Re-judge strictly from the evidence shown. If an upstream output is wrong, CORRECT it:
-set `corrected: true`, output your OWN kept_bd_ids, your OWN citations, and explain in `reason`.
+set `corrected: true`, output your OWN kept_bd_ids (must be valid aliases from bd_candidates / bd_mappings), your OWN citations, and explain in `reason`.
 
 Exact Verdict per user step (EXACTLY one of):
-- COVERED: >=1 BD mapping is genuinely about this behavior AND code evidence (valid citation in snippets) supports the same outcome.
-- BD_MISSING: Code evidence supports the user step (valid citation required) but NO BD unit describes it (e.g. a user-visible dialog the BD collapsed). Cite the code lines.
+- COVERED: The step's business behavior is confirmed. Two admissible bases:
+  (i) `own_citation`: >=1 valid citation in the shown snippets supports the step's outcome AND >=1 kept BD unit genuinely describes the behavior. (You may adopt valid upstream anchor citations).
+  (ii) `bd_verdict`: >=1 kept BD unit has a BD<->code verdict of MATCH or PARTIAL that genuinely implements this step's behavior. In this case you MUST set `basis_bd_id` to that BD unit's alias (and it must also appear in `kept_bd_ids`); no code citation is required. Without a citation, a COVERED with no `basis_bd_id` is rejected.
+      For a BD unit whose verdict is PARTIAL, its `bd_code_verdict_reason` / `bd_code_verdict_evidence` must support THIS step's specific subclaim — a PARTIAL unit verified on an unrelated part of its behavior is NOT an admissible basis.
+  A kept BD unit whose upstream mapping `relation` is "related" is NOT coverage-bearing: it marks the same screen/area, not the same behavior. Keep it only for CONTRADICTED reasoning.
+- BD_MISSING: Code evidence supports the user step (valid citation required) but NO candidate BD unit in the catalog describes it (e.g. customer feature absent from specification). If a valid citation supports the step and NO candidate BD unit fits, BD_MISSING is the expected answer (NOT UNVERIFIABLE) — but you must SAY it: emit verdict "BD_MISSING" with empty `kept_bd_ids`. A COVERED with empty `kept_bd_ids` is malformed and is discarded, never read as BD_MISSING.
 - CONTRADICTED: A BD unit and user step assert DIFFERENT outcomes for the same behavior (e.g. BD says 'retry' vs user says 'show error'), OR code (cited) contradicts the user claim. Requires a positive conflict. Name the conflicting BD unit and/or cite the conflicting line.
 - UNVERIFIABLE: Cannot confirm nor refute from available evidence (includes presentation claims: layout/color/font; includes cases where snippets are missing or insufficient). Prefer over guessing.
 
@@ -83,7 +127,8 @@ Divergence field:
 
 Citations:
 - Citations are LOCATIONS ONLY (rel_path, line_start, line_end) pointing inside the provided snippets. The system re-fetches the verbatim text.
-- kept_bd_ids: list of BD unit aliases (e.g. ["bd1"]) from the proposals/catalog that genuinely describe this step. If none survive, emit [].
+- kept_bd_ids: list of BD unit aliases (e.g. ["bd1"]) from the candidate catalog / proposals that genuinely describe this step. Must use aliases from the provided registry.
+- basis_bd_id: the BD unit alias (e.g. "bd1") providing the BD<->code verdict justification when using basis (ii), or null.
 
 Output schema:
 Respond ONLY with a JSON object:
@@ -94,6 +139,7 @@ Respond ONLY with a JSON object:
       "verdict": "COVERED",
       "divergence": null,
       "kept_bd_ids": ["bd1"],
+      "basis_bd_id": "bd1",
       "citations": [{"rel_path": "HSBMENU5.pfd", "line_start": 12, "line_end": 18}],
       "corrected": false,
       "reason": "..."
@@ -121,6 +167,7 @@ class LLMVerdictItem(BaseModel):
     verdict: str  # COVERED | BD_MISSING | CONTRADICTED | UNVERIFIABLE
     divergence: str | None = None  # scope | behavioural | None
     kept_bd_ids: list[str] = Field(default_factory=list)
+    basis_bd_id: str | None = None
     citations: list[LLMCitation] = Field(default_factory=list)
     corrected: bool = False
     reason: str = ""
@@ -155,6 +202,7 @@ class StepVerdictContext:
     snippet_id_map: dict[str, Snippet]
     anchor_proposals: list[dict[str, Any]]
     bd_proposals: list[dict[str, Any]]
+    bd_candidates: list[dict[str, Any]]
     bd_alias_map: dict[str, dict[str, Any]]
     bd_id_to_alias: dict[str, str]
 
@@ -173,6 +221,8 @@ class VerdictRunSummary:
     unverifiable_steps: int
     out_of_scope_steps: int
     bd_extra_count: int
+    bd_unmapped_count: int
+    bd_unassessed_count: int
     flow_verdicts: dict[str, str]
     step_verdicts: dict[str, str]
     activity_verdicts: dict[str, str] = field(default_factory=dict)
@@ -207,6 +257,8 @@ async def evaluate_verdict_batch(
                 "relation": p.get("relation"),
                 "confidence": p.get("confidence"),
                 "bd_code_verdict": p.get("bd_code_verdict"),
+                "bd_code_verdict_reason": p.get("bd_code_verdict_reason", ""),
+                "bd_code_verdict_evidence": p.get("bd_code_verdict_evidence", []),
                 "reason": p.get("reason"),
             })
 
@@ -234,6 +286,7 @@ async def evaluate_verdict_batch(
                 ],
             },
             "bd_mappings": bd_mappings_payload,
+            "bd_candidates": ctx.bd_candidates,
             "snippets": [
                 {
                     "rel_path": s.rel_path,
@@ -266,6 +319,19 @@ async def evaluate_verdict_batch(
         parsed = coerce_results_wrapper(_parse_llm_json(text))
         validated = LLMVerdictBatchResponse.model_validate(parsed)
         assert_exact_id_coverage([r.unit_id for r in validated.results], expected_aliases, "User flow verdict verifier")
+
+        # Closed schema validation: validate that kept_bd_ids and basis_bd_id use recognized aliases
+        ctx_by_alias = {c.step_alias: c for c in batch}
+        for r in validated.results:
+            c = ctx_by_alias.get(r.unit_id)
+            if c:
+                for k_id in r.kept_bd_ids:
+                    if k_id not in c.bd_alias_map and k_id not in c.bd_id_to_alias:
+                        raise ValueError(f"User flow verdict verifier: unknown kept_bd_id '{k_id}' for step {r.unit_id}")
+                if r.basis_bd_id:
+                    if r.basis_bd_id not in c.bd_alias_map and r.basis_bd_id not in c.bd_id_to_alias:
+                        raise ValueError(f"User flow verdict verifier: unknown basis_bd_id '{r.basis_bd_id}' for step {r.unit_id}")
+
         return {r.unit_id: r for r in validated.results}
 
     start = time.monotonic()
@@ -282,17 +348,19 @@ async def evaluate_verdict_batch(
     results: dict[str, LLMVerdictItem] = {}
     for alias_id, item in parsed_items.items():
         real_uid = real_of.get(alias_id, alias_id)
-        # Remap kept_bd_ids back from alias (e.g. bd1 -> real bd_id)
+        # Remap kept_bd_ids and basis_bd_id back from alias (e.g. bd1 -> real bd_id)
         ctx_for_step = next((c for c in batch if c.user_step_id == real_uid), None)
         if ctx_for_step:
             remapped_kept = []
             for b_alias in item.kept_bd_ids:
                 if b_alias in ctx_for_step.bd_alias_map:
                     remapped_kept.append(ctx_for_step.bd_alias_map[b_alias]["bd_id"])
-                else:
-                    # If model returned real bd_id directly
+                elif b_alias in ctx_for_step.bd_id_to_alias:
                     remapped_kept.append(b_alias)
             item.kept_bd_ids = remapped_kept
+            if item.basis_bd_id:
+                if item.basis_bd_id in ctx_for_step.bd_alias_map:
+                    item.basis_bd_id = ctx_for_step.bd_alias_map[item.basis_bd_id]["bd_id"]
         results[real_uid] = item
 
     return results, raw_resp, retries, latency_ms
@@ -312,6 +380,7 @@ async def run_user_flow_verdicts(
     skipped_step_ids: set[str] | None = None,
     activities: list[dict[str, Any]] | None = None,
     step_bd_scope: dict[str, list[str]] | None = None,
+    unresolved_step_ids: set[str] | None = None,
 ) -> VerdictRunSummary:
     """Execute Phase U Stage 4: Verdict verification on user steps + activity rollups + flow rollups + BD_EXTRA.
 
@@ -327,7 +396,7 @@ async def run_user_flow_verdicts(
     async with db.execute("SELECT local_path FROM repo_snapshots WHERE id = ?", (snapshot_id,)) as cur:
         snap_row = await cur.fetchone()
     local_path = snap_row[0] if isinstance(snap_row, (tuple, list)) else (snap_row["local_path"] if snap_row else "")
-    local_p = Path(local_path) if local_path else Path(".")
+    local_p = Path(local_path) if local_path and str(local_path).strip() else ""
 
     # 2. Fetch manifest files
     async with db.execute("SELECT rel_path FROM manifest_files WHERE snapshot_id = ?", (snapshot_id,)) as cur:
@@ -359,11 +428,11 @@ async def run_user_flow_verdicts(
         "sheet": r[12], "row_start": r[13], "row_end": r[14]
     } for r in step_rows]
 
-    # 4. Load persisted anchors & mappings & align audit artifacts
+    # 4. Load persisted anchors & mappings & align audit artifacts for the current run
     async with db.execute(
         "SELECT step_id, rel_path, line_start, line_end, kind, valid, reason FROM user_code_anchors "
-        "WHERE snapshot_id = ? AND step_id IN (SELECT s.id FROM user_steps s JOIN user_flows f ON s.flow_id = f.id WHERE f.doc_id = ?)",
-        (snapshot_id, doc_id),
+        "WHERE snapshot_id = ? AND run_id = ? AND step_id IN (SELECT s.id FROM user_steps s JOIN user_flows f ON s.flow_id = f.id WHERE f.doc_id = ?)",
+        (snapshot_id, run_id, doc_id),
     ) as cur:
         anchor_rows = await cur.fetchall()
     anchors_by_step: dict[str, list[dict[str, Any]]] = {}
@@ -373,10 +442,14 @@ async def run_user_flow_verdicts(
         }
         anchors_by_step.setdefault(d["step_id"], []).append(d)
 
+    # This stage owns the 'ubmv:' rows it synthesizes for verifier-added mappings; drop the prior
+    # judgment's rows first so a re-judged run starts from the mapper's own proposals only.
+    await db.execute("DELETE FROM user_bd_mappings WHERE run_id = ? AND id LIKE 'ubmv:%'", (run_id,))
+
     async with db.execute(
         "SELECT user_step_id, bd_kind, bd_id, relation, confidence, reason FROM user_bd_mappings "
-        "WHERE user_step_id IN (SELECT s.id FROM user_steps s JOIN user_flows f ON s.flow_id = f.id WHERE f.doc_id = ?)",
-        (doc_id,),
+        "WHERE run_id = ? AND user_step_id IN (SELECT s.id FROM user_steps s JOIN user_flows f ON s.flow_id = f.id WHERE f.doc_id = ?)",
+        (run_id, doc_id),
     ) as cur:
         mapping_rows = await cur.fetchall()
     mappings_by_step: dict[str, list[dict[str, Any]]] = {}
@@ -387,8 +460,8 @@ async def run_user_flow_verdicts(
         mappings_by_step.setdefault(d["user_step_id"], []).append(d)
 
     async with db.execute(
-        "SELECT ref_id, payload FROM user_run_artifacts WHERE doc_id = ? AND ref_id LIKE 'align:%'",
-        (doc_id,),
+        "SELECT ref_id, payload FROM user_run_artifacts WHERE doc_id = ? AND run_id = ? AND ref_id LIKE 'align:%'",
+        (doc_id, run_id),
     ) as cur:
         align_art_rows = await cur.fetchall()
     align_artifacts_by_step: dict[str, dict[str, Any]] = {}
@@ -473,34 +546,91 @@ async def run_user_flow_verdicts(
                     "reason": a.get("reason"),
                 })
 
-        # Load BD proposals enriched with BD unit metadata & BD<->code verdict
-        raw_mappings = mappings_by_step.get(s["id"], [])
-        bd_proposals = []
+        # Build the step's BD candidate registry. Preferred source: the EXACT registry the mapper
+        # saw, replayed from its align artifact — rebuilding it here would score with different
+        # inputs and could show the verifier a different catalog than the one the proposals came
+        # from, which makes "no candidate fits" (BD_MISSING) unsafe. The rebuild is the fallback
+        # for runs whose align stage predates the registry (or ran offline).
+        align_art = align_artifacts_by_step.get(s["id"], {})
+        persisted_registry = align_art.get("bd_registry") or []
+
+        registry_entries: list[dict[str, Any]]
+        if persisted_registry:
+            registry_entries = [
+                {
+                    "bd_id": e.get("bd_id"),
+                    "bd_kind": e.get("bd_kind", "step"),
+                    "name": e.get("name") or e.get("bd_id"),
+                    "flow_name": e.get("flow_name", ""),
+                    "functionality": e.get("functionality", ""),
+                }
+                for e in persisted_registry
+                if e.get("bd_id")
+            ]
+        else:
+            step_code_files = set(screen_files)
+            registry_entries = [
+                {
+                    "bd_id": u.unit_id,
+                    "bd_kind": u.bd_kind,
+                    "name": render_bd_candidate_name(u),
+                    "flow_name": u.flow_name,
+                    "functionality": u.description or "",
+                }
+                for u in _shortlist_bd_candidates(s, bd_ctx, step_code_files)
+            ]
+
+        bd_candidates = []
         bd_alias_map = {}
         bd_id_to_alias = {}
-        for b_i, m in enumerate(raw_mappings, start=1):
-            bd_id = m["bd_id"]
-            bd_alias = f"bd{b_i}"
-            bd_unit = bd_unit_by_id.get(bd_id)
-            bu_v = bd_verdicts_by_unit.get(bd_id, {})
 
-            p_data = {
-                "bd_id": bd_id,
-                "bd_alias": bd_alias,
-                "bd_kind": m.get("bd_kind") or (bd_unit.bd_kind if bd_unit else "step"),
-                "name": bd_unit.name if bd_unit else bd_id,
-                "functionality": bd_unit.description if bd_unit else "",
-                "relation": m.get("relation", "realizes"),
-                "confidence": m.get("confidence", 0.8),
+        for c_i, entry in enumerate(registry_entries, start=1):
+            c_alias = f"bd{c_i}"
+            bu_v = bd_verdicts_by_unit.get(entry["bd_id"], {})
+            u_data = {
+                **entry,
+                "bd_alias": c_alias,
                 "bd_code_verdict": bu_v.get("verdict", "UNKNOWN"),
-                "reason": m.get("reason", ""),
+                "bd_code_verdict_reason": bu_v.get("reason", ""),
+                "bd_code_verdict_evidence": _summarize_unit_evidence(bu_v.get("evidence_json")),
             }
-            bd_proposals.append(p_data)
-            bd_alias_map[bd_alias] = p_data
-            bd_id_to_alias[bd_id] = bd_alias
+            bd_candidates.append(u_data)
+            bd_alias_map[c_alias] = u_data
+            bd_id_to_alias[entry["bd_id"]] = c_alias
 
-        # Presentation flag from align artifact
-        align_art = align_artifacts_by_step.get(s["id"], {})
+        # Load BD proposals referencing the candidate aliases (or creating new alias if outside shortlist)
+        raw_mappings = mappings_by_step.get(s["id"], [])
+        bd_proposals = []
+        for m in raw_mappings:
+            bd_id = m["bd_id"]
+            bd_alias = bd_id_to_alias.get(bd_id)
+            if not bd_alias:
+                bd_alias = f"bd{len(bd_candidates) + len(bd_proposals) + 1}"
+                bd_unit = bd_unit_by_id.get(bd_id)
+                bu_v = bd_verdicts_by_unit.get(bd_id, {})
+                p_data = {
+                    "bd_id": bd_id,
+                    "bd_alias": bd_alias,
+                    "bd_kind": m.get("bd_kind") or (bd_unit.bd_kind if bd_unit else "step"),
+                    "name": render_bd_candidate_name(bd_unit) if bd_unit else bd_id,
+                    "flow_name": bd_unit.flow_name if bd_unit else "",
+                    "functionality": bd_unit.description if bd_unit else "",
+                    "relation": m.get("relation", "realizes"),
+                    "confidence": m.get("confidence"),
+                    "bd_code_verdict": bu_v.get("verdict", "UNKNOWN"),
+                    "bd_code_verdict_reason": bu_v.get("reason", ""),
+                    "bd_code_verdict_evidence": _summarize_unit_evidence(bu_v.get("evidence_json")),
+                    "reason": m.get("reason", ""),
+                }
+                bd_alias_map[bd_alias] = p_data
+                bd_id_to_alias[bd_id] = bd_alias
+            else:
+                p_data = dict(bd_alias_map[bd_alias])
+                p_data["relation"] = m.get("relation", "realizes")
+                p_data["confidence"] = m.get("confidence")
+                p_data["reason"] = m.get("reason", "")
+            bd_proposals.append(p_data)
+
         is_presentation = bool(align_art.get("presentation", False))
 
         contexts.append(
@@ -523,6 +653,7 @@ async def run_user_flow_verdicts(
                 snippet_id_map=snippet_id_map,
                 anchor_proposals=anchor_proposals,
                 bd_proposals=bd_proposals,
+                bd_candidates=bd_candidates,
                 bd_alias_map=bd_alias_map,
                 bd_id_to_alias=bd_id_to_alias,
             )
@@ -570,12 +701,21 @@ async def run_user_flow_verdicts(
 
     final_step_verdicts: dict[str, str] = {}
     surviving_kept_bd_ids: set[str] = set()
+    # Verifier-kept ids that no mapper row backs are the verifier's OWN mapping claim; they are
+    # persisted so the report can show the mapping that BD-side coverage is asserted from.
+    synthesized_mappings: list[tuple[str, str, str, str, str, str, float | None, str, str]] = []
+
+    relations_by_step: dict[str, dict[str, str]] = {}
+    for s_id, m_list in mappings_by_step.items():
+        for m in m_list:
+            relations_by_step.setdefault(s_id, {})[m["bd_id"]] = (m.get("relation") or "").strip().lower()
 
     # Process in-scope steps
     for ctx in contexts:
         sid = ctx.user_step_id
         model_out = llm_results_by_step.get(sid)
         meta = step_meta_by_step.get(sid, {})
+        v_basis_bd_id: str | None = None
 
         if model_out is None:
             # Fallback when no provider or LLM failed
@@ -643,6 +783,15 @@ async def run_user_flow_verdicts(
             v_corrected = model_out.corrected
             v_basis = None
 
+            # Only coverage-bearing relations can carry COVERED. A `related` mapping marks topical
+            # adjacency (and is the raw material for CONTRADICTED) — it never asserts that the BD
+            # unit realizes the step, so it must not be able to mark the step or the unit covered.
+            step_relations = relations_by_step.get(sid, {})
+            coverage_kept = [
+                b_id for b_id in v_kept
+                if step_relations.get(b_id, "realizes") in COVERAGE_RELATIONS
+            ]
+
             # Resolve verifier citations + window containment check
             cits_resolved = []
             for c in model_out.citations:
@@ -692,31 +841,72 @@ async def run_user_flow_verdicts(
                     v_reason = f"{v_reason} [NO_CITATION]"
                 else:
                     v_basis = "own_citation"
-            # Fusion Rule 4: COVERED requires valid citation OR mapped BD unit with MATCH/PARTIAL
+            # Fusion Rule 4 (UP3-3 invariant): COVERED <=> >=1 kept coverage-bearing BD mapping AND
+            # (own valid citation OR a named basis unit, kept, whose stored verdict is MATCH/PARTIAL).
             elif v_verdict == "COVERED":
-                if valid_cits:
+                if not coverage_kept:
+                    # A COVERED with nothing kept is a malformed answer, not a finding: BD_MISSING is
+                    # only ever the model's own explicit verdict (it alone can assert "no candidate
+                    # fits"), so this demotes rather than inventing a divergence.
+                    v_verdict = "UNVERIFIABLE"
+                    v_div = None
+                    v_reason = f"{v_reason} [NO_COVERAGE_BEARING_KEPT_BD]"
+                elif valid_cits:
                     v_basis = "own_citation"
                 else:
-                    # Check if any kept BD mapping has BD<->code verdict MATCH or PARTIAL
-                    matching_bd = any(
-                        bd_verdicts_by_unit.get(b_id, {}).get("verdict") in ("MATCH", "PARTIAL")
-                        for b_id in v_kept
-                    )
-                    if matching_bd:
-                        v_basis = "bd_verdict"
-                    else:
+                    # Basis (ii): the gate — not the model — is the authority on the stored
+                    # BD<->code verdict, and the model must NAME the unit it is relying on. Picking
+                    # an arbitrary qualifying kept unit would bypass the same-behaviour judgment the
+                    # prompt asks for (and is unsafe for PARTIAL units verified on another subclaim).
+                    named_basis = model_out.basis_bd_id
+                    basis_verdict = bd_verdicts_by_unit.get(named_basis or "", {}).get("verdict")
+                    if not named_basis:
                         v_verdict = "UNVERIFIABLE"
                         v_div = None
-                        v_reason = f"{v_reason} [NO_CITATION]"
+                        v_reason = f"{v_reason} [NO_CITATION_NO_BASIS_BD_ID]"
+                    elif named_basis not in coverage_kept:
+                        v_verdict = "UNVERIFIABLE"
+                        v_div = None
+                        v_reason = f"{v_reason} [BASIS_BD_ID_NOT_KEPT]"
+                    elif basis_verdict not in ("MATCH", "PARTIAL"):
+                        v_verdict = "UNVERIFIABLE"
+                        v_div = None
+                        v_reason = f"{v_reason} [BASIS_BD_VERDICT_{basis_verdict or 'UNKNOWN'}]"
+                    else:
+                        v_basis = "bd_verdict"
+                        v_basis_bd_id = named_basis
 
-        # Record surviving kept BD IDs
+        # BD-side coverage comes ONLY from coverage-bearing kept mappings of a COVERED step.
         if v_verdict == "COVERED":
-            surviving_kept_bd_ids.update(v_kept)
+            surviving_kept_bd_ids.update(
+                b_id for b_id in v_kept
+                if relations_by_step.get(sid, {}).get(b_id, "realizes") in COVERAGE_RELATIONS
+            )
+
+        # A kept id the mapper never proposed is the verifier's own correction; persist it so the
+        # report renders the mapping that BD-side coverage and the branch rollup are claimed from.
+        for b_id in v_kept:
+            if b_id in relations_by_step.get(sid, {}):
+                continue
+            unit = bd_unit_by_id.get(b_id)
+            synthesized_mappings.append((
+                f"ubmv:{new_id()}",
+                run_id,
+                sid,
+                unit.bd_kind if unit else "step",
+                b_id,
+                "realizes",
+                None,
+                f"[verifier-added] {v_reason}",
+                now,
+            ))
+            relations_by_step.setdefault(sid, {})[b_id] = "realizes"
 
         final_step_verdicts[sid] = v_verdict
 
         ev_json = json.dumps({
             "kept_bd_ids": v_kept,
+            "basis_bd_id": v_basis_bd_id,
             "basis": v_basis,
             "corrected": v_corrected,
             "citations": [
@@ -765,6 +955,7 @@ async def run_user_flow_verdicts(
                 "reason": v_reason,
                 "corrected": v_corrected,
                 "basis": v_basis,
+                "basis_bd_id": v_basis_bd_id,
                 "kept_bd_ids": v_kept,
                 "citation_resolutions": [
                     {
@@ -784,17 +975,24 @@ async def run_user_flow_verdicts(
             now,
         ))
 
-    # Process Tier-1 skipped steps (NONE matched activity -> UNVERIFIABLE)
+    # Process Tier-1 skipped steps (NONE / UNRESOLVED matched activity -> UNVERIFIABLE). The two
+    # are gated alike but reported apart: "no BD flow exists" is a finding, "matching failed" is not.
+    unresolved_set = unresolved_step_ids or set()
     for s in tier1_skipped_steps:
         sid = s["id"]
+        is_unresolved = sid in unresolved_set
         v_verdict = "UNVERIFIABLE"
         v_div = None
-        v_reason = "TIER1_NONE_MATCH: Step skipped Tier-2 alignment because its activity has no matching BD flow."
+        v_reason = (
+            "TIER1_UNRESOLVED: Step skipped Tier-2 alignment because Tier-1 matching did not resolve for its activity."
+            if is_unresolved
+            else "TIER1_NONE_MATCH: Step skipped Tier-2 alignment because its activity has no matching BD flow."
+        )
         final_step_verdicts[sid] = v_verdict
 
         ev_json = json.dumps({
             "kept_bd_ids": [],
-            "basis": "tier1_none_match",
+            "basis": "tier1_unresolved" if is_unresolved else "tier1_none_match",
             "corrected": False,
             "citations": [],
             "skipped": True,
@@ -1004,32 +1202,65 @@ async def run_user_flow_verdicts(
             now,
         ))
 
-    # 12. BD-Side Verdicts (BD_EXTRA vs COVERED)
+    # 12. BD-Side Verdicts (BD_EXTRA vs BD_UNMAPPED vs COVERED - Codex R2/R5)
     bd_verdicts_to_insert: list[tuple[str, str, str, str, str, str, str, str, str, str | None, str, str, str]] = []
-    all_mapped_bd_ids: set[str] = set()
-    for m_list in mappings_by_step.values():
-        for m in m_list:
-            all_mapped_bd_ids.add(m["bd_id"])
 
-    # BD-side must enumerate the FULL cluster catalog: with step_bd_scope, bd_ctx is union-scoped
-    # to tier-1-matched flows only, which would silently drop unmatched flows' units — precisely
-    # the strongest BD_EXTRA candidates ("BD describes it, no customer flow references it").
+    # Get Tier-1 match status per flow in current run
+    async with db.execute(
+        "SELECT activity_id, bd_flow_id, match_status FROM user_activity_matches WHERE run_id = ?",
+        (run_id,),
+    ) as cur:
+        act_match_rows = await cur.fetchall()
+
+    matched_tier1_flow_ids: set[str] = set()
+    unresolved_tier1_flow_ids: set[str] = set()
+    # An activity whose tier-1 matching failed carries no flow id, so it makes the ABSENCE of a
+    # pair unusable as evidence: nothing in the catalog can honestly be called BD_EXTRA that run.
+    tier1_unresolved_globally = False
+    for r in act_match_rows:
+        bf_id = r[1] if isinstance(r, (tuple, list)) else r["bd_flow_id"]
+        m_stat = r[2] if isinstance(r, (tuple, list)) else r["match_status"]
+        if m_stat == "UNRESOLVED":
+            tier1_unresolved_globally = True
+        if bf_id:
+            if m_stat in ("FULLY", "PARTIAL"):
+                matched_tier1_flow_ids.add(bf_id)
+            elif m_stat == "UNRESOLVED":
+                unresolved_tier1_flow_ids.add(bf_id)
+
+    # BD-side must enumerate the FULL cluster catalog
     bd_side_ctx = bd_ctx
     if step_bd_scope:
         bd_side_ctx = await load_bd_context(db, cluster_id)
 
     bd_extra_count = 0
+    bd_unmapped_count = 0
+    bd_unassessed_count = 0
+
     for u in bd_side_ctx.units:
-        is_referenced = (u.unit_id in surviving_kept_bd_ids) or (u.unit_id in all_mapped_bd_ids)
-        if is_referenced:
+        # Strict: BD unit is COVERED only if >=1 verifier-kept mapping reached it
+        is_covered = u.unit_id in surviving_kept_bd_ids
+
+        if is_covered:
             bd_side_verdict = "COVERED"
             bd_side_div = None
-            bd_side_reason = "Referenced by user flow mapping."
+            bd_side_reason = "Referenced and verified by user flow step."
         else:
-            bd_side_verdict = "BD_EXTRA"
-            bd_side_div = "scope"
-            bd_side_reason = "BD describes behavior not referenced by any user flow step."
-            bd_extra_count += 1
+            if u.flow_id in matched_tier1_flow_ids:
+                bd_side_verdict = "BD_UNMAPPED"
+                bd_side_div = None
+                bd_side_reason = "Parent flow matched in Tier-1, but no user step mapped to this specific unit."
+                bd_unmapped_count += 1
+            elif u.flow_id in unresolved_tier1_flow_ids or tier1_unresolved_globally:
+                bd_side_verdict = "UNRESOLVED"
+                bd_side_div = None
+                bd_side_reason = "Tier-1 matching did not resolve for this run; BD-side status unknown."
+                bd_unassessed_count += 1
+            else:
+                bd_side_verdict = "BD_EXTRA"
+                bd_side_div = "scope"
+                bd_side_reason = "BD describes behavior not referenced by any user flow step."
+                bd_extra_count += 1
 
         bd_v_id = f"uv:{new_id()}"
         bd_verdicts_to_insert.append((
@@ -1044,15 +1275,21 @@ async def run_user_flow_verdicts(
             bd_side_verdict,
             bd_side_div,
             bd_side_reason,
-            json.dumps({"name": u.name, "description": u.description}, ensure_ascii=False),
+            json.dumps({"name": u.name, "description": u.description, "flow_name": u.flow_name}, ensure_ascii=False),
             now,
         ))
 
-    # 13. Delete + Replace user_verdicts for (doc_id, cluster_id, snapshot_id)
+    # 13. Replace user_verdicts (and this stage's own synthesized mappings) for this run_id
     await db.execute(
-        "DELETE FROM user_verdicts WHERE doc_id = ? AND cluster_id = ? AND snapshot_id = ?",
-        (doc_id, cluster_id, snapshot_id),
+        "DELETE FROM user_verdicts WHERE run_id = ?",
+        (run_id,),
     )
+    for sm in synthesized_mappings:
+        await db.execute(
+            "INSERT INTO user_bd_mappings (id, run_id, user_step_id, bd_kind, bd_id, relation, confidence, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            sm,
+        )
 
     # Insert step, activity, flow, and bd verdicts
     all_verdicts = step_verdicts_to_insert + activity_verdicts_to_insert + flow_verdicts_to_insert + bd_verdicts_to_insert
@@ -1097,6 +1334,8 @@ async def run_user_flow_verdicts(
         unverifiable_steps=global_counts["UNVERIFIABLE"],
         out_of_scope_steps=global_counts["OUT_OF_SCOPE"],
         bd_extra_count=bd_extra_count,
+        bd_unmapped_count=bd_unmapped_count,
+        bd_unassessed_count=bd_unassessed_count,
         flow_verdicts=final_flow_verdicts,
         step_verdicts=final_step_verdicts,
         activity_verdicts=final_activity_verdicts,

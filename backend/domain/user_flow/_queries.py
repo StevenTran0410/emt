@@ -1,10 +1,14 @@
 """Report and query helpers for Phase U User Flow Alignment (TICKET U4).
 
 Builds the structured user flow report containing:
+- The publication run_id: the newest run that wrote a completion marker (an in-progress or failed
+  run is invisible; every run-scoped read is filtered by that run_id).
 - High-level user flows with flow_match rollup and step-level counts.
+- Activities with per-(activity, bd_flow) pair cells plus the best status over those pairs.
 - Step-level cards with primary English labels (text_en / name_en) + Japanese originals.
-- Verifiable evidence: kept BD mappings and code citations with verbatim fetched_text.
-- BD_EXTRA list: BD units not covered by the user flow.
+- Verifiable evidence: verifier-KEPT BD mappings and code citations with verbatim fetched_text.
+- BD_EXTRA list (spec finding) and BD_UNMAPPED list (tier-2 recall artifact), kept separate.
+- Branch-coverage rollup with per-branch fan-in and the user-flow-gap flag.
 - Summary counts for flows and steps.
 """
 from __future__ import annotations
@@ -12,20 +16,69 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ._align import COVERAGE_RELATIONS
+
+
+async def _resolve_published_run_id(
+    db: Any,
+    doc_id: str,
+    cluster_id: str | None,
+    snapshot_id: str | None,
+    pinned_run_id: str | None = None,
+) -> str | None:
+    """Return the run this report may be built from, or None when nothing is published.
+
+    A run qualifies only if it wrote a `__run_complete__` marker whose payload names the SAME
+    (doc_id, cluster_id, snapshot_id) the caller asked about — a marker is the run's own record of
+    what it analysed, so a run of another cluster/snapshot can never answer this request. A pinned
+    `run_id` narrows the search; it does not waive the marker or the tuple check.
+    """
+    async with db.execute(
+        "SELECT run_id, payload FROM user_run_artifacts "
+        "WHERE doc_id = ? AND ref_id = '__run_complete__' "
+        "ORDER BY created_at DESC",
+        (doc_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+
+    for r in rows:
+        r_run_id = r[0] if isinstance(r, (tuple, list)) else r["run_id"]
+        r_payload = r[1] if isinstance(r, (tuple, list)) else r["payload"]
+        if pinned_run_id is not None and r_run_id != pinned_run_id:
+            continue
+        try:
+            payload = json.loads(r_payload or "{}")
+        except Exception:
+            payload = {}
+        if cluster_id is not None and payload.get("cluster_id") != cluster_id:
+            continue
+        if snapshot_id is not None and payload.get("snapshot_id") != snapshot_id:
+            continue
+        return r_run_id
+
+    return None
+
 
 async def get_user_flow_report(
     db: Any,
     doc_id: str,
-    cluster_id: str,
-    snapshot_id: str,
+    cluster_id: str | None = None,
+    snapshot_id: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
-    """Retrieve full User Flow Alignment report JSON for API/UI."""
-    # 1. Fetch user doc info
+    """Retrieve full User Flow Alignment report JSON for the specified doc_id and last completed run_id."""
+    # 0. Resolve the publication run_id: the newest run that wrote a completion marker FOR THIS
+    # (doc, cluster, snapshot). A run without the marker (in progress or failed mid-way) is
+    # invisible, and a completed run of another cluster/snapshot must never answer this request.
+    # An explicit `run_id` pins a run but does not bypass either check.
+    chosen_run_id = await _resolve_published_run_id(db, doc_id, cluster_id, snapshot_id, run_id)
+
+    # 1. Fetch document metadata
     async with db.execute("SELECT id, source_name, file_hash, imported_at FROM user_flow_docs WHERE id = ?", (doc_id,)) as cur:
-        doc_row = await cur.fetchone()
-    doc_info = dict(doc_row) if doc_row and hasattr(doc_row, "keys") else (
-        {"id": doc_row[0], "source_name": doc_row[1], "file_hash": doc_row[2], "imported_at": doc_row[3]} if doc_row else None
-    )
+        row = await cur.fetchone()
+        doc_info = dict(row) if row and hasattr(row, "keys") else (
+            {"id": row[0], "source_name": row[1], "file_hash": row[2], "imported_at": row[3]} if row else None
+        )
 
     # 2. Fetch user flows
     async with db.execute(
@@ -60,13 +113,16 @@ async def get_user_flow_report(
         for r in step_rows
     ]
 
-    # 4. Fetch verdicts for this (doc_id, cluster_id, snapshot_id)
-    async with db.execute(
-        "SELECT id, run_id, side, ref_id, ref_kind, verdict, divergence, reason, evidence_json "
-        "FROM user_verdicts WHERE doc_id = ? AND cluster_id = ? AND snapshot_id = ?",
-        (doc_id, cluster_id, snapshot_id),
-    ) as cur:
-        verdict_rows = await cur.fetchall()
+    # 4. Fetch verdicts for this (doc_id, cluster_id, snapshot_id, chosen_run_id). With no
+    # published run every run-scoped read stays empty — partial state is never displayed.
+    verdict_rows: list[Any] = []
+    if chosen_run_id:
+        async with db.execute(
+            "SELECT id, run_id, side, ref_id, ref_kind, verdict, divergence, reason, evidence_json "
+            "FROM user_verdicts WHERE doc_id = ? AND cluster_id = ? AND snapshot_id = ? AND run_id = ?",
+            (doc_id, cluster_id, snapshot_id, chosen_run_id),
+        ) as cur:
+            verdict_rows = await cur.fetchall()
 
     step_verdicts: dict[str, dict[str, Any]] = {}
     activity_verdicts: dict[str, dict[str, Any]] = {}
@@ -106,12 +162,15 @@ async def get_user_flow_report(
         }
         activities_by_flow.setdefault(act["flow_id"], []).append(act)
 
-    async with db.execute(
-        "SELECT activity_id, bd_flow_id, match_status, confidence, reason FROM user_activity_matches "
-        "WHERE activity_id IN (SELECT id FROM user_activities WHERE flow_id IN (SELECT id FROM user_flows WHERE doc_id = ?))",
-        (doc_id,),
-    ) as cur:
-        act_match_rows = await cur.fetchall()
+    act_match_rows: list[Any] = []
+    if chosen_run_id:
+        async with db.execute(
+            "SELECT activity_id, bd_flow_id, match_status, confidence, reason FROM user_activity_matches "
+            "WHERE activity_id IN (SELECT id FROM user_activities WHERE flow_id IN (SELECT id FROM user_flows WHERE doc_id = ?)) "
+            "AND run_id = ?",
+            (doc_id, chosen_run_id),
+        ) as cur:
+            act_match_rows = await cur.fetchall()
 
     matches_by_act: dict[str, list[dict[str, Any]]] = {}
     for r in act_match_rows:
@@ -121,11 +180,35 @@ async def get_user_flow_report(
         matches_by_act.setdefault(m["activity_id"], []).append(m)
 
     # 5. Fetch step verdict audit artifacts for fetched_text extraction
-    async with db.execute(
-        "SELECT ref_id, payload FROM user_run_artifacts WHERE doc_id = ? AND ref_id LIKE 'verdict:%'",
-        (doc_id,),
-    ) as cur:
-        verdict_art_rows = await cur.fetchall()
+    verdict_art_rows: list[Any] = []
+    align_art_rows: list[Any] = []
+    if chosen_run_id:
+        async with db.execute(
+            "SELECT ref_id, payload FROM user_run_artifacts WHERE doc_id = ? AND run_id = ? AND ref_id LIKE 'verdict:%'",
+            (doc_id, chosen_run_id),
+        ) as cur:
+            verdict_art_rows = await cur.fetchall()
+        async with db.execute(
+            "SELECT ref_id, payload FROM user_run_artifacts WHERE doc_id = ? AND run_id = ? AND ref_id LIKE 'align:%'",
+            (doc_id, chosen_run_id),
+        ) as cur:
+            align_art_rows = await cur.fetchall()
+
+    # Mapper-side review flags per (step, bd unit) — e.g. a confident member_of whose guard class
+    # nothing corroborates. The gate keeps such a mapping; the report must not hide it.
+    mapping_flags: dict[str, dict[str, str]] = {}
+    for r in align_art_rows:
+        ref_id = r[0] if isinstance(r, (tuple, list)) else r["ref_id"]
+        payload_str = r[1] if isinstance(r, (tuple, list)) else r["payload"]
+        step_id = ref_id.split(":", 1)[1] if ":" in ref_id else ref_id
+        try:
+            payload = json.loads(payload_str)
+        except Exception:
+            continue
+        for m in payload.get("mappings", []):
+            flag = m.get("guard_class_flag")
+            if flag and m.get("bd_id"):
+                mapping_flags.setdefault(step_id, {})[m["bd_id"]] = flag
 
     artifacts_by_step: dict[str, dict[str, Any]] = {}
     for r in verdict_art_rows:
@@ -171,12 +254,15 @@ async def get_user_flow_report(
         bu_verdict_map = {r[0]: (r[1] if isinstance(r, (tuple, list)) else r["verdict"]) for r in await cur.fetchall()}
 
     # 7. Fetch user_bd_mappings for step mappings
-    async with db.execute(
-        "SELECT user_step_id, bd_kind, bd_id, relation, confidence, reason FROM user_bd_mappings "
-        "WHERE user_step_id IN (SELECT s.id FROM user_steps s JOIN user_flows f ON s.flow_id = f.id WHERE f.doc_id = ?)",
-        (doc_id,),
-    ) as cur:
-        mapping_rows = await cur.fetchall()
+    mapping_rows: list[Any] = []
+    if chosen_run_id:
+        async with db.execute(
+            "SELECT user_step_id, bd_kind, bd_id, relation, confidence, reason FROM user_bd_mappings "
+            "WHERE user_step_id IN (SELECT s.id FROM user_steps s JOIN user_flows f ON s.flow_id = f.id WHERE f.doc_id = ?) "
+            "AND run_id = ?",
+            (doc_id, chosen_run_id),
+        ) as cur:
+            mapping_rows = await cur.fetchall()
     mappings_by_step: dict[str, list[dict[str, Any]]] = {}
     for r in mapping_rows:
         d = dict(r) if hasattr(r, "keys") else {
@@ -226,14 +312,14 @@ async def get_user_flow_report(
                 "valid": bool(c.get("valid", True)),
             })
 
-        # Assemble kept BD mappings
+        # Assemble kept BD mappings (strict: verifier-kept mappings only)
         kept_bd_ids = set(ev_data.get("kept_bd_ids") or art_payload.get("kept_bd_ids") or [])
         step_raw_mappings = mappings_by_step.get(sid, [])
         kept_mappings = []
 
         for m in step_raw_mappings:
             b_id = m["bd_id"]
-            if b_id in kept_bd_ids or (verdict == "COVERED" and len(kept_bd_ids) == 0):
+            if b_id in kept_bd_ids:
                 b_step = bd_steps.get(b_id)
                 b_branch = bd_branches.get(b_id)
                 name = b_step["name"] if b_step else (f"Branch ({b_branch['branch_kind']})" if b_branch else b_id)
@@ -246,7 +332,11 @@ async def get_user_flow_report(
                     "functionality": func,
                     "bd_kind": m.get("bd_kind", "step"),
                     "relation": m.get("relation", "realizes"),
-                    "confidence": m.get("confidence", 0.8),
+                    # None for verifier-added mappings: the verifier asserts the link, it does not
+                    # score it — inventing 0.8 here would fake a confidence nobody produced.
+                    "confidence": m.get("confidence"),
+                    "coverage_bearing": (m.get("relation") or "").strip().lower() in COVERAGE_RELATIONS,
+                    "guard_class_flag": mapping_flags.get(sid, {}).get(b_id),
                     "bd_verdict": b_verdict,
                     "reason": m.get("reason", ""),
                 })
@@ -324,12 +414,23 @@ async def get_user_flow_report(
             act_match = act_v_row.get("verdict", "UNCOVERED")
             activity_counts[act_match] = activity_counts.get(act_match, 0) + 1
 
+            def _status_rank(s: str) -> int:
+                return {"FULLY": 3, "PARTIAL": 2, "UNRESOLVED": 1, "NONE": 0}.get(s, 0)
+
             act_matches = matches_by_act.get(act_id, [])
-            match_status = act_matches[0]["match_status"] if act_matches else "NONE"
+            if act_matches:
+                match_status = max((m["match_status"] for m in act_matches), key=_status_rank)
+            else:
+                # No published run yet => the match was never attempted; "NO BD FLOW" would be a lie.
+                match_status = "NONE" if chosen_run_id else "UNRESOLVED"
+
             matched_bd_flows = []
+            seen_bf_ids = set()
             for m in act_matches:
-                if m.get("bd_flow_id") and m["bd_flow_id"] in b_flows:
-                    bf = b_flows[m["bd_flow_id"]]
+                bf_id = m.get("bd_flow_id")
+                if bf_id and bf_id in b_flows and bf_id not in seen_bf_ids:
+                    seen_bf_ids.add(bf_id)
+                    bf = b_flows[bf_id]
                     matched_bd_flows.append({
                         "bd_flow_id": bf["id"],
                         "name": bf["name"],
@@ -357,6 +458,17 @@ async def get_user_flow_report(
             for ast in a_steps:
                 a_counts[ast["verdict"]] = a_counts.get(ast["verdict"], 0) + 1
 
+            pair_matches = [
+                {
+                    "bd_flow_id": m.get("bd_flow_id"),
+                    "bd_flow_name": b_flows.get(m["bd_flow_id"], {}).get("name", "") if m.get("bd_flow_id") else None,
+                    "match_status": m["match_status"],
+                    "confidence": m.get("confidence", 0.0),
+                    "reason": m.get("reason", ""),
+                }
+                for m in act_matches
+            ]
+
             f_activities.append({
                 "id": act_id,
                 "flow_id": f_id,
@@ -375,6 +487,7 @@ async def get_user_flow_report(
                 "origin": act.get("origin", "llm"),
                 "match_status": match_status,
                 "matched_bd_flows": matched_bd_flows,
+                "pair_matches": pair_matches,
                 "activity_match": act_match,
                 "counts": a_counts,
                 "reason": act_v_row.get("reason", ""),
@@ -390,36 +503,123 @@ async def get_user_flow_report(
             "sheet": f["sheet"],
             "scope_note": f["scope_note"],
             "flow_match": f_match,
+            "divergence": f_v_row.get("divergence"),
+            "reason": f_v_row.get("reason", ""),
             "counts": f_counts,
             "activities": f_activities,
             "steps": f_steps,
         })
 
-    # 10. Assemble BD_EXTRA list
+    # 10. Assemble BD_EXTRA and BD_UNMAPPED lists (Codex R2/R5)
     bd_extra_list = []
+    bd_unmapped_list = []
     for u_id, v_row in bd_verdicts.items():
-        if v_row.get("verdict") == "BD_EXTRA":
-            b_step = bd_steps.get(u_id)
-            b_branch = bd_branches.get(u_id)
-            name = b_step["name"] if b_step else (f"Branch ({b_branch['branch_kind']})" if b_branch else u_id)
-            func = b_step["functionality"] if b_step else (b_branch["guard_description"] if b_branch else "")
-            bd_extra_list.append({
-                "bd_id": u_id,
-                "name": name,
-                "functionality": func,
-                "bd_kind": v_row.get("ref_kind", "step"),
-                "verdict": "BD_EXTRA",
-                "divergence": v_row.get("divergence", "scope"),
-                "reason": v_row.get("reason", "BD describes behavior not referenced in user flows"),
-                "bd_verdict": bu_verdict_map.get(u_id),
-            })
+        v = v_row.get("verdict")
+        b_step = bd_steps.get(u_id)
+        b_branch = bd_branches.get(u_id)
+        name = b_step["name"] if b_step else (f"Branch ({b_branch['branch_kind']})" if b_branch else u_id)
+        func = b_step["functionality"] if b_step else (b_branch["guard_description"] if b_branch else "")
+        flow_id = b_step["flow_id"] if b_step else (b_branch["flow_id"] if b_branch else "")
+        flow_name = b_flows.get(flow_id, {}).get("name", "")
+
+        entry = {
+            "bd_id": u_id,
+            "name": name,
+            "flow_id": flow_id,
+            "flow_name": flow_name,
+            "functionality": func,
+            "bd_kind": v_row.get("ref_kind", "step"),
+            "verdict": v,
+            "divergence": v_row.get("divergence"),
+            "reason": v_row.get("reason", ""),
+            "bd_verdict": bu_verdict_map.get(u_id),
+        }
+        if v == "BD_EXTRA":
+            bd_extra_list.append(entry)
+        elif v == "BD_UNMAPPED":
+            bd_unmapped_list.append(entry)
+
+    # 11. Assemble Branch Coverage Rollup (Task C / D / G)
+    steps_lookup = {s["id"]: s for s in steps}
+    flows_lookup = {fl["id"]: fl for fl in flows}
+    branch_coverage = []
+    for b_id, b_branch in bd_branches.items():
+        b_kind = (b_branch.get("branch_kind") or "").lower()
+        if b_kind in ("success", "normal"):
+            continue
+        flow_id = b_branch.get("flow_id", "")
+        flow_name = b_flows.get(flow_id, {}).get("name", "")
+
+        # Fan-in = COVERED steps whose verifier-KEPT mapping onto this branch is coverage-bearing
+        # (`related` marks adjacency, so it must not count as a user case realizing the guard).
+        incoming_step_ids = []
+        incoming_steps = []
+        for sid, m_list in mappings_by_step.items():
+            if step_verdicts.get(sid, {}).get("verdict") != "COVERED":
+                continue
+            ev_str = step_verdicts.get(sid, {}).get("evidence_json") or "{}"
+            try:
+                k_ids = json.loads(ev_str).get("kept_bd_ids", [])
+            except Exception:
+                k_ids = []
+            if b_id not in k_ids:
+                continue
+            rel = next(
+                ((m.get("relation") or "").strip().lower() for m in m_list if m["bd_id"] == b_id),
+                "",
+            )
+            if rel in COVERAGE_RELATIONS:
+                incoming_step_ids.append(sid)
+                s_obj = steps_lookup.get(sid)
+                if s_obj:
+                    fl_obj = flows_lookup.get(s_obj.get("flow_id", ""))
+                    incoming_steps.append({
+                        "id": sid,
+                        "ordinal": s_obj.get("ordinal", 0),
+                        "text_en": s_obj.get("text_en") or s_obj.get("text_ja", ""),
+                        "flow_name": (fl_obj.get("name_en") or fl_obj.get("name_ja", "")) if fl_obj else "",
+                    })
+
+        # Check parent flow Tier-1 match status across activities
+        parent_matches = [
+            m.get("match_status")
+            for m_list in matches_by_act.values() for m in m_list
+            if m.get("bd_flow_id") == flow_id
+        ]
+        if any(ms == "FULLY" for ms in parent_matches):
+            parent_tier1_status = "FULLY"
+        elif any(ms == "PARTIAL" for ms in parent_matches):
+            parent_tier1_status = "PARTIAL"
+        elif any(ms == "UNRESOLVED" for ms in parent_matches):
+            parent_tier1_status = "UNRESOLVED"
+        else:
+            parent_tier1_status = "NONE" if chosen_run_id else "UNRESOLVED"
+
+        flow_has_match = parent_tier1_status in ("FULLY", "PARTIAL")
+        is_user_flow_gap = len(incoming_step_ids) == 0 and flow_has_match
+
+        branch_coverage.append({
+            "branch_id": b_id,
+            "flow_id": flow_id,
+            "flow_name": flow_name,
+            "branch_kind": b_branch.get("branch_kind", "error"),
+            "guard_description": b_branch.get("guard_description", ""),
+            "incoming_step_count": len(incoming_step_ids),
+            "incoming_step_ids": incoming_step_ids,
+            "incoming_steps": incoming_steps,
+            "parent_tier1_status": parent_tier1_status,
+            "is_user_flow_gap": is_user_flow_gap,
+            "bd_verdict": bu_verdict_map.get(b_id),
+        })
 
     in_scope_steps_count = sum(1 for s in steps if s.get("in_scope", 1) == 1)
 
     return {
         "doc": doc_info,
+        "run_id": chosen_run_id,
         "summary": {
             "doc_id": doc_id,
+            "run_id": chosen_run_id,
             "cluster_id": cluster_id,
             "snapshot_id": snapshot_id,
             "total_flows": len(flows),
@@ -430,9 +630,12 @@ async def get_user_flow_report(
             "activity_counts": activity_counts,
             "step_counts": step_counts,
             "bd_extra_count": len(bd_extra_list),
+            "bd_unmapped_count": len(bd_unmapped_list),
         },
         "flows": report_flows,
         "bd_extra": bd_extra_list,
+        "bd_unmapped": bd_unmapped_list,
+        "branch_coverage": branch_coverage,
     }
 
 

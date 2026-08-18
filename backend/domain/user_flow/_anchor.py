@@ -138,7 +138,7 @@ async def seed_literal_hits(
         rows = await cur.fetchall()
 
     manifest_paths = [r[0] if isinstance(r, (tuple, list)) else r["rel_path"] for r in rows]
-    if not manifest_paths and Path(local_path).is_dir():
+    if not manifest_paths and local_path and str(local_path).strip() and Path(local_path).is_dir():
         # Fallback: scan files directly on disk under local_path
         manifest_paths = [
             str(p.relative_to(local_path)).replace("\\", "/")

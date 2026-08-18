@@ -40,6 +40,9 @@ class BDUnit:
     flow_id: str  # flow id it belongs to (or self for flow)
     name: str  # name / branch kind
     description: str  # description / functionality / guard_description
+    flow_name: str = ""
+    source_step_name: str = ""
+    target_step_name: str = ""
     verdict: str | None = None
     verdict_reason: str | None = None
 
@@ -152,11 +155,13 @@ async def load_bd_context(
         verdicts_map[u_id] = (v_val, v_rsn or "")
 
     # 5. Build BD units with stable aliases bd1..bdM
+    step_names: dict[str, str] = {}
     steps_by_flow: dict[str, list[dict[str, Any]]] = {}
     for r in step_rows:
         s_dict = dict(r) if hasattr(r, "keys") else {
             "id": r[0], "flow_id": r[1], "name": r[2], "functionality": r[3], "ordinal": r[4]
         }
+        step_names[s_dict["id"]] = s_dict.get("name") or ""
         steps_by_flow.setdefault(s_dict["flow_id"], []).append(s_dict)
 
     branches_by_flow: dict[str, list[dict[str, Any]]] = {}
@@ -181,6 +186,7 @@ async def load_bd_context(
             "id": fr[0], "name": fr[1], "description": fr[2], "ordinal": fr[3]
         }
         f_id = f_dict["id"]
+        f_name = f_dict.get("name") or ""
         f_alias = f"bd{counter}"
         counter += 1
 
@@ -193,8 +199,9 @@ async def load_bd_context(
             unit_id=f_id,
             bd_kind="flow",
             flow_id=f_id,
-            name=f_dict.get("name") or "",
+            name=f_name,
             description=f_dict.get("description") or "",
+            flow_name=f_name,
             verdict=f_verdict,
             verdict_reason=f_verdict_rsn,
         )
@@ -224,6 +231,7 @@ async def load_bd_context(
                 flow_id=f_id,
                 name=s.get("name") or "",
                 description=s.get("functionality") or "",
+                flow_name=f_name,
                 verdict=s_verdict,
                 verdict_reason=s_verdict_rsn,
             )
@@ -246,6 +254,9 @@ async def load_bd_context(
             b_verdict = b_verdict_info[0] if b_verdict_info else None
             b_verdict_rsn = b_verdict_info[1] if b_verdict_info else None
 
+            src_sname = step_names.get(b.get("source_step_id") or "", "")
+            tgt_sname = step_names.get(b.get("target_step_id") or "", "")
+
             b_unit = BDUnit(
                 alias=b_alias,
                 unit_id=b_id,
@@ -253,6 +264,9 @@ async def load_bd_context(
                 flow_id=f_id,
                 name=b.get("branch_kind") or "branch",
                 description=b.get("guard_description") or "",
+                flow_name=f_name,
+                source_step_name=src_sname,
+                target_step_name=tgt_sname,
                 verdict=b_verdict,
                 verdict_reason=b_verdict_rsn,
             )
@@ -422,7 +436,7 @@ async def map_user_steps_to_bd(
     provider_id: str | None,
 ) -> tuple[int, int]:
     """Execute Stage U3 user-step to BD-unit mapping.
-    
+
     Returns (mapped_steps_count, batches_issued).
     """
     now = utc_now_iso()

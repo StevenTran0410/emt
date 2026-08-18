@@ -929,6 +929,24 @@ CREATE INDEX IF NOT EXISTS ix_user_activity_matches_act ON user_activity_matches
 CREATE INDEX IF NOT EXISTS ix_user_activity_matches_run ON user_activity_matches(run_id);
         """,
     },
+    {
+        "version": 17,
+        "description": "Prune orphaned user flow alignment and failed match rows",
+        "sql": """
+DELETE FROM user_bd_mappings WHERE user_step_id NOT IN (SELECT id FROM user_steps);
+DELETE FROM user_code_anchors WHERE step_id NOT IN (SELECT id FROM user_steps);
+-- side='user' rows point at user_* ids; side='bd' rows point at BD unit ids and share the ref_kind
+-- vocabulary ('step'/'flow'), so each side must be pruned against its own id space.
+DELETE FROM user_verdicts WHERE side = 'user' AND ref_kind = 'step' AND ref_id NOT IN (SELECT id FROM user_steps);
+DELETE FROM user_verdicts WHERE side = 'user' AND ref_kind = 'case' AND ref_id NOT IN (SELECT id FROM user_cases);
+DELETE FROM user_verdicts WHERE side = 'user' AND ref_kind = 'activity' AND ref_id NOT IN (SELECT id FROM user_activities);
+DELETE FROM user_verdicts WHERE side = 'user' AND ref_kind = 'flow' AND ref_id NOT IN (SELECT id FROM user_flows);
+DELETE FROM user_verdicts WHERE doc_id NOT IN (SELECT id FROM user_flow_docs);
+DELETE FROM user_activity_matches WHERE activity_id NOT IN (SELECT id FROM user_activities);
+DELETE FROM user_activities WHERE flow_id NOT IN (SELECT id FROM user_flows);
+DELETE FROM user_activity_matches WHERE reason = 'LLM_NO_RESPONSE' AND run_id NOT IN (SELECT run_id FROM user_run_artifacts WHERE ref_id = '__run_complete__');
+        """,
+    },
 ]
 
 TARGET_VERSION = len(_MIGRATIONS) - 1
